@@ -11,36 +11,32 @@ import ui.Messages;
 import java.util.*;
 import java.util.stream.Collectors;
 
-@Component // Permet à Spring de gérer l'instanciation du GameManager (singleton par défaut)
+@Component
 public class GameManager {
 
-    // --- ATTRIBUTS PRINCIPAUX ---
-    private final Map<Integer, Player> players = new HashMap<>(); // Stocke tous les joueurs (clé = id unique)
-    private final int WINNING_SCORE = 10000; // Score à atteindre pour gagner la partie
-    private Player currentPlayer;            // Joueur dont c'est le tour actuellement
-    private Player opponentPlayer;           // Adversaire (pour deux joueurs)
-    private Turn currentTurn;                // Tour en cours (gestion des dés, score temporaire, etc.)
-    private boolean gameActuallyOver = false;// Indique si la partie est terminée
-    private int uniquePlayerIdCounter = 0;   // Générateur d’ID pour chaque nouveau joueur
-    private final ScoreCalculator scoreCalculator; // Gestion du calcul des scores et des combinaisons
-
+    private final Map<Integer, Player> players = new HashMap<>();
+    private final int WINNING_SCORE = 10000;
+    private Player currentPlayer;
+    private Player opponentPlayer;
+    private Turn currentTurn;
+    private boolean gameActuallyOver = false;
+    private int uniquePlayerIdCounter = 0;
+    private final ScoreCalculator scoreCalculator;
     private boolean stateChangedFlag = true;
 
-    public Integer getState() {
-        if (stateChangedFlag) {
-            stateChangedFlag = false; // reset le flag juste après l’appel
-            return 1;
-        }
-        return 0;
-    }
-
-    // --- CONSTRUCTEUR ---
     public GameManager() {
         this.scoreCalculator = new ScoreCalculator();
         System.out.println("GameManager initialisé.");
     }
 
-    // --- RÉINITIALISE TOUTE LA PARTIE ---
+    public Integer getState() {
+        if (stateChangedFlag) {
+            stateChangedFlag = false;
+            return 1;
+        }
+        return 0;
+    }
+
     public void resetGame() {
         players.clear();
         currentPlayer = null;
@@ -51,10 +47,8 @@ public class GameManager {
         System.out.println("GameManager: La partie a été réinitialisée.");
     }
 
-
-    // --- INSCRIT UN JOUEUR ---
     public RestPlayer addPlayer(String name) {
-        if (players.size() >= 2) { // Seulement deux joueurs maximum
+        if (players.size() >= 2) {
             return null;
         }
         Player player = new Player(name, new ArrayList<>());
@@ -62,7 +56,6 @@ public class GameManager {
         players.put(player.getId(), player);
         System.out.println("GameManager: Joueur " + name + " (ID: " + player.getId() + ") ajouté.");
 
-        // Si deux joueurs : la partie commence !
         if (players.size() == 2) {
             List<Player> playerList = new ArrayList<>(players.values());
             currentPlayer = playerList.get(0);
@@ -75,14 +68,17 @@ public class GameManager {
         return toRestPlayer(player);
     }
 
-    // --- RÉCUPÈRE UN ÉTAT GLOBAL (DTO) DU JEU ---
     public TurnStatusDTO getGameState() {
+        if (!isGameReady()) {
+            return waitingForPlayersDTO();
+        }
         TurnStatusDTO dto = createBaseDTO();
         return finalizeDTO(dto);
     }
 
-    // --- LANCER LES DÉS ---
     public TurnStatusDTO roll() {
+        if (!isGameReady()) return waitingForPlayersDTO();
+
         System.out.println("=== [DEBUG] ROLL demandé ===");
         System.out.println("Etat initial : currentPlayer = " + (currentPlayer != null ? currentPlayer.getName() : "null"));
         System.out.println("Dice avant roll : " + (currentTurn != null ? currentTurn.getDiceOnPlate() : "null"));
@@ -96,13 +92,11 @@ public class GameManager {
             }
         } else {
             dto.turnEvents.addAll(currentTurn.rollDiceAndEvaluate());
-
             System.out.println("Dice après roll : " + currentTurn.getDiceOnPlate());
             System.out.println("Temp score après roll : " + currentTurn.getTemporaryScore());
-
         }
 
-        // Si le joueur a fait "Farkle" (aucun point possible)
+        // *** SEULEMENT APRÈS UN FARKLE on passe la main ***
         if (currentTurn.isFarkle()) {
             dto.gameState = "FARKLE_TURN_ENDED";
             dto.immersiveMessage = Messages.randomFarkle();
@@ -111,25 +105,28 @@ public class GameManager {
         stateChangedFlag = true;
 
         System.out.println("[DEBUG] Avant return roll → gameState = " + dto.gameState + ", tempScore = " + dto.tempScore);
-
         return finalizeDTO(dto);
     }
 
-    // --- SÉLECTIONNER DES DÉS ---
     public TurnStatusDTO select(String diceValuesInput) {
+        if (!isGameReady()) return waitingForPlayersDTO();
+
         TurnStatusDTO dto = createBaseDTO();
         if (!isActionValidForCurrentPlayer(dto)) return dto;
+
+        // *** On NE passe PAS la main ici ***
         dto.turnEvents.addAll(currentTurn.selectDice(diceValuesInput));
         stateChangedFlag = true;
         return finalizeDTO(dto);
     }
 
-    // --- METTRE EN BANQUE LES POINTS ---
     public TurnStatusDTO bank() {
+        if (!isGameReady()) return waitingForPlayersDTO();
+
         TurnStatusDTO dto = createBaseDTO();
         if (!isActionValidForCurrentPlayer(dto)) return dto;
 
-        // Cas spécial Hot Dice : forcer la résolution avant banker
+        // Résolution Hot Dice au besoin
         if (currentTurn.isHotDiceChoicePending()) {
             dto.turnEvents.addAll(currentTurn.resolveHotDiceChoice(true));
         }
@@ -137,7 +134,7 @@ public class GameManager {
         if (currentTurn.canPlayerBank()) {
             int pointsToBankThisTurn = currentTurn.getTemporaryScore();
 
-            // S'il reste des dés scorants non mis en banque
+            // BONUS: Si dés scorants non gardés, on les ajoute (optionnel selon ta règle maison)
             if (!currentTurn.getDiceOnPlate().isEmpty()) {
                 List<Dice> scorables = scoreCalculator.findScoringDice(currentTurn.getDiceOnPlate());
                 if (!scorables.isEmpty()) {
@@ -153,13 +150,13 @@ public class GameManager {
                 currentTurn.signalTurnBankedOrFarkled();
                 dto.currentPlayerScore = currentPlayer.getScore();
 
-                // Si le joueur atteint ou dépasse le score de victoire
                 if (currentPlayer.getScore() >= WINNING_SCORE) {
                     gameActuallyOver = true;
                     dto.winningPlayerName = playerName;
                     dto.winningPlayerScore = currentPlayer.getScore();
                     dto.gameState = "GAME_OVER";
                 } else {
+                    // *** ICI on passe la main ***
                     switchPlayer();
                     dto.gameState = "TURN_BANKED";
                 }
@@ -173,7 +170,30 @@ public class GameManager {
         return finalizeDTO(dto);
     }
 
-    // --- UTILITAIRE : Valide l'action selon l'état du jeu ---
+    // ----- Utilitaires et helpers -----
+
+    private boolean isGameReady() {
+        return players.size() == 2 && currentTurn != null && currentPlayer != null && opponentPlayer != null;
+    }
+
+    private TurnStatusDTO waitingForPlayersDTO() {
+        TurnStatusDTO dto = new TurnStatusDTO();
+        dto.gameState = "WAITING_FOR_PLAYERS";
+        dto.immersiveMessage = "En attente d'un adversaire...";
+        dto.availableActions = Collections.emptyList();
+        if (currentPlayer != null) {
+            dto.currentPlayerId = currentPlayer.getId();
+            dto.currentPlayerName = currentPlayer.getName();
+            dto.currentPlayerScore = currentPlayer.getScore();
+        }
+        if (opponentPlayer != null) {
+            dto.opponentPlayerId = opponentPlayer.getId();
+            dto.opponentPlayerName = opponentPlayer.getName();
+            dto.opponentPlayerScore = opponentPlayer.getScore();
+        }
+        return dto;
+    }
+
     private boolean isActionValidForCurrentPlayer(TurnStatusDTO dto) {
         if (currentTurn == null || currentPlayer == null || gameActuallyOver) {
             dto.immersiveMessage = "La partie est terminée ou n'a pas commencé.";
@@ -182,7 +202,6 @@ public class GameManager {
         return true;
     }
 
-    // --- Crée un DTO de base pour le tour en cours ---
     private TurnStatusDTO createBaseDTO() {
         TurnStatusDTO dto = new TurnStatusDTO();
         if (this.currentPlayer != null) {
@@ -195,13 +214,10 @@ public class GameManager {
             dto.opponentPlayerName = this.opponentPlayer.getName();
             dto.opponentPlayerScore = this.opponentPlayer.getScore();
         }
-
         return dto;
     }
 
-    // --- Finalise le DTO (complète les infos selon l'état du jeu) ---
     private TurnStatusDTO finalizeDTO(TurnStatusDTO dto) {
-        // Actualise les scores et infos joueurs
         if (this.currentPlayer != null) {
             dto.currentPlayerId = this.currentPlayer.getId();
             dto.currentPlayerName = this.currentPlayer.getName();
@@ -213,7 +229,6 @@ public class GameManager {
             dto.opponentPlayerScore = this.opponentPlayer.getScore();
         }
 
-        // Gestion de l'état du jeu et des actions possibles pour le front
         if (gameActuallyOver) {
             dto.gameState = "GAME_OVER";
             Player winner = players.values().stream().max(Comparator.comparingInt(Player::getScore)).orElse(null);
@@ -225,11 +240,6 @@ public class GameManager {
                 dto.immersiveMessage = "La partie est terminée !";
             }
             dto.availableActions = Collections.emptyList();
-
-            if ("FARKLE_TURN_ENDED".equals(dto.gameState) || "TURN_BANKED".equals(dto.gameState)) {
-
-            }
-
         } else if (currentTurn != null) {
             dto.diceOnPlate = currentTurn.getDiceOnPlate().stream().map(Dice::getValue).collect(Collectors.toList());
             dto.keptDiceThisTurn = currentTurn.getKeptDiceThisTurn().stream().map(Dice::getValue).collect(Collectors.toList());
@@ -240,43 +250,37 @@ public class GameManager {
                 dto.gameState = "HOT_DICE_CHOICE";
                 dto.immersiveMessage = "HOT DICE ! Relancer ou sécuriser " + dto.tempScore + " pts ?";
                 dto.availableActions.addAll(Arrays.asList("CHOOSE_HOT_DICE_BANK", "CHOOSE_HOT_DICE_ROLL"));
-            } else {
-                if (currentTurn.canPlayerSelect()) {
-                    dto.gameState = "POST_ROLL_CHOICE";
-                    dto.immersiveMessage = "Quels trésors vas-tu garder ?";
-                    dto.availableActions.add("SELECT_DICE");
-                } else if (currentTurn.canPlayerRoll()) {
-                    dto.gameState = "POST_SELECTION_CHOICE";
-                    dto.immersiveMessage = Messages.randomNewRoll();
-                    dto.availableActions.add("ROLL");
-                }
-                if (currentTurn.canPlayerBank()) {
-                    dto.availableActions.add("BANK");
-                }
+            } else if (currentTurn.canPlayerSelect()) {
+                dto.gameState = "POST_ROLL_CHOICE";
+                dto.immersiveMessage = "Quels trésors vas-tu garder ?";
+                dto.availableActions.add("SELECT_DICE");
+            } else if (currentTurn.canPlayerRoll()) {
+                dto.gameState = "POST_SELECTION_CHOICE";
+                dto.immersiveMessage = Messages.randomNewRoll();
+                dto.availableActions.add("ROLL");
+            }
+            if (currentTurn.canPlayerBank()) {
+                dto.availableActions.add("BANK");
             }
         } else {
             dto.gameState = "WAITING_FOR_PLAYERS";
             dto.immersiveMessage = "En attente de joueurs...";
         }
 
-        // Permettre de quitter tant que la partie n'est pas terminée
         if (!gameActuallyOver) {
             dto.availableActions.add("QUIT_GAME");
         }
+        // Logs pour debug
         System.out.println("DEBUG DTO: " + dto.gameState + " | " + dto.availableActions + " | " + dto.immersiveMessage);
         System.out.println("[FINAL DTO] gameState = " + dto.gameState);
         System.out.println("[FINAL DTO] diceOnPlate = " + dto.diceOnPlate);
         System.out.println("[FINAL DTO] keptDice = " + dto.keptDiceThisTurn);
         System.out.println("[FINAL DTO] tempScore = " + dto.tempScore);
         System.out.println("---------------------------------------------------------");
-        System.out.println("[DEBUG] finalizeDTO() → gameState = " + dto.gameState +
-                " | availableActions = " + dto.availableActions +
-                " | message = " + dto.immersiveMessage);
         return dto;
-
     }
 
-    // --- Passe la main à l'autre joueur ---
+    // Passe la main UNIQUEMENT après BANK ou FARKLE
     private void switchPlayer() {
         if (gameActuallyOver) { return; }
         if (players.size() == 2 && currentPlayer != null) {
@@ -287,9 +291,8 @@ public class GameManager {
         }
     }
 
-    // --- MÉTHODES UTILITAIRES EXPOSÉES À L'API ---
+    // --- API rest helpers
     public int getCurrentPlayerId() { return currentPlayer != null ? currentPlayer.getId() : -1; }
-
     public int getActualTurnPoints() { return currentTurn != null ? currentTurn.getTemporaryScore() : 0; }
 
     public RestDices getDicePlate() {
@@ -314,8 +317,6 @@ public class GameManager {
         return rd;
     }
 
-
-
     public RestPlayer getWinner() {
         if (gameActuallyOver) {
             return players.values().stream()
@@ -323,11 +324,9 @@ public class GameManager {
                     .map(this::toRestPlayer)
                     .orElse(null);
         }
-
         return null;
     }
 
-    // --- Retire un joueur et termine la partie ---
     public boolean quit(Integer playerId) {
         if (playerId == null || !players.containsKey(playerId)) return false;
         players.remove(playerId);
@@ -336,7 +335,6 @@ public class GameManager {
         return true;
     }
 
-    // --- Convertit un Player (interne) vers RestPlayer (pour l'API REST) ---
     private RestPlayer toRestPlayer(Player p) {
         if (p == null) return null;
         RestPlayer rp = new RestPlayer();
@@ -345,5 +343,4 @@ public class GameManager {
         rp.setScore(p.getScore());
         return rp;
     }
-
 }

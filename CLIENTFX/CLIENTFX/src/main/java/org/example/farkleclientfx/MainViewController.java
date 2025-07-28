@@ -1,7 +1,5 @@
-// Contenu COMPLET et FINAL pour MainViewController.java, intégrant vos corrections.
-
 package org.example.farkleclientfx;
-import io.swagger.client.model.RestDices;
+
 import io.swagger.client.ApiException;
 import io.swagger.client.model.RestPlayer;
 import io.swagger.client.model.TurnStatusDTO;
@@ -9,7 +7,6 @@ import javafx.animation.PauseTransition;
 import javafx.application.Platform;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
-import javafx.concurrent.ScheduledService;
 import javafx.concurrent.Task;
 import javafx.fxml.FXML;
 import javafx.geometry.Pos;
@@ -18,7 +15,6 @@ import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.StackPane;
-import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
 import javafx.scene.shape.Rectangle;
 import javafx.scene.text.Text;
@@ -26,6 +22,11 @@ import javafx.util.Duration;
 import org.example.farkleclientfx.service.FarkleRestService;
 
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 public class MainViewController {
@@ -41,10 +42,14 @@ public class MainViewController {
     private final FarkleRestService farkleService = new FarkleRestService();
     private Integer myPlayerId = null;
     private String myName = null;
-    private ScheduledService<TurnStatusDTO> pollingService;
     private TurnStatusDTO dernierEtatRecu = new TurnStatusDTO();
     private ObservableList<Map<String, String>> defaultScoreRules;
     private final List<DieView> diceViewsOnPlate = new ArrayList<>();
+
+    // === AJOUTS POUR LE POLLING AVEC ScheduledThreadPoolExecutor ===
+    private ScheduledExecutorService pollingExecutor;
+    private ScheduledFuture<?> pollingFuture;
+    private final AtomicBoolean isPollingActive = new AtomicBoolean(false);
 
     @FXML
     private void initialize() {
@@ -54,7 +59,13 @@ public class MainViewController {
         btnKeep.setOnAction(e -> handlerKeep());
         btnQuit.setOnAction(e -> handleQuit());
 
-        createPollingService();
+        // Initialiser le thread pool pour le polling
+        pollingExecutor = Executors.newScheduledThreadPool(1, r -> {
+            Thread t = new Thread(r, "Farkle-Polling-Thread");
+            t.setDaemon(true); // Thread daemon pour ne pas bloquer la fermeture
+            return t;
+        });
+
         resetUIForNewGame();
         Platform.runLater(this::inscriptionJoueurEtDebut);
 
@@ -62,15 +73,14 @@ public class MainViewController {
         loadAvatars();
     }
 
-    private void handleNewGame() {
-        Alert infoDialog = new Alert(Alert.AlertType.INFORMATION);
-        infoDialog.setTitle("Nouvelle Partie");
-        infoDialog.setHeaderText("Procédure pour commencer une nouvelle partie");
-        infoDialog.setContentText("Pour garantir une réinitialisation complète, veuillez fermer cette application et redémarrer manuellement le serveur.");
-        infoDialog.showAndWait();
+    private void handleQuit() {
+        // Arrêt propre du polling avant de quitter
+        stopPolling();
+        if (pollingExecutor != null) {
+            pollingExecutor.shutdown();
+        }
+        Platform.exit();
     }
-
-    private void handleQuit() { Platform.exit(); }
 
     private void loadAvatars() {
         try {
@@ -78,11 +88,13 @@ public class MainViewController {
             playerAvatar.setImage(avatar1);
             Image avatar2 = new Image(getClass().getResource("images/avatar_joueur2.png").toExternalForm());
             opponentAvatar.setImage(avatar2);
-        } catch (Exception e) { System.err.println("Erreur chargement avatars: " + e.getMessage()); }
+        } catch (Exception e) {
+            System.err.println("Erreur chargement avatars: " + e.getMessage());
+        }
     }
 
     private void inscriptionJoueurEtDebut() {
-        resetUIForNewGame(); // Arrête tout polling précédent et nettoie l'UI
+        resetUIForNewGame();
         TextInputDialog dialog = new TextInputDialog("Pirate");
         dialog.setTitle("Inscription Pirate");
         dialog.setHeaderText("Quel est ton nom de pirate ?");
@@ -98,59 +110,100 @@ public class MainViewController {
             RestPlayer joueur = farkleService.inscrireJoueur(myName);
             myPlayerId = joueur.getId();
             myName = joueur.getName();
+            System.out.println("[INSCRIPTION] Joueur inscrit : myName = " + myName + ", myPlayerId = " + myPlayerId);
             tourLabel.setText("🏴‍☠️ Bienvenue " + myName + " ! En attente d'un adversaire...");
 
-            // On démarre le polling APRÈS s'être inscrit avec succès.
+            // Démarrer le polling après l'inscription
             startPolling();
+
         } catch (ApiException e) {
             afficherAlerteErreur("Erreur d'Inscription", "Impossible de s'inscrire : " + e.getMessage());
         }
     }
 
-    private void createPollingService() {
-        pollingService = new ScheduledService<TurnStatusDTO>() {
-            @Override
-            protected Task<TurnStatusDTO> createTask() {
-                return new Task<>() {
-                    @Override
-                    protected TurnStatusDTO call() throws ApiException {
-                        // Le polling ne s'active que si ce n'est pas notre tour
-                        if (!isMyTurn(dernierEtatRecu)) {
-                            // On vérifie si l'état du serveur a changé
-                            if (farkleService.getState() == 1) {
-                                // Si oui, on récupère l'état complet via notre astuce
-                                return farkleService.banker();
+    // === MÉTHODES DE POLLING AVEC ScheduledThreadPoolExecutor ===
+
+    private void startPolling() {
+        if (isPollingActive.compareAndSet(false, true)) {
+            System.out.println("[POLLING] Démarrage du polling");
+
+            // Tâche de polling qui s'exécute toutes les 2 secondes
+            Runnable pollingTask = () -> {
+                try {
+                    // Vérifier si l'état a changé
+                    Integer stateChanged = farkleService.getState();
+                    System.out.println("[POLL] /stateChanged → " + stateChanged);
+
+                    if (stateChanged == 1) {
+                        // Si changement, récupérer l'état complet
+                        System.out.println("[POLL] Changement détecté, appel /banker");
+                        TurnStatusDTO newState = farkleService.banker();
+
+                        // Mettre à jour l'UI dans le thread JavaFX
+                        Platform.runLater(() -> {
+                            majInterfaceAvecEtat(newState);
+
+                            // Si la partie a commencé et ce n'est pas notre tour, continuer le polling
+                            // Si c'est notre tour ou si la partie est terminée, arrêter
+                            if ("GAME_OVER".equals(newState.gameState) ||
+                                    (!"WAITING_FOR_PLAYERS".equals(newState.gameState) && isMyTurn(newState))) {
+                                stopPolling();
                             }
-                        }
-                        return null; // Sinon (si c'est notre tour ou si rien n'a bougé), on ne fait rien.
+                        });
                     }
-                };
+                } catch (ApiException e) {
+                    System.err.println("[POLL] Erreur API : " + e.getMessage());
+                } catch (Exception e) {
+                    System.err.println("[POLL] Erreur inattendue : " + e.getMessage());
+                    e.printStackTrace();
+                }
+            };
+
+            // Planifier l'exécution périodique (toutes les 2 secondes)
+            pollingFuture = pollingExecutor.scheduleAtFixedRate(
+                    pollingTask,
+                    0,              // Délai initial (0 = démarrage immédiat)
+                    2,              // Période
+                    TimeUnit.SECONDS
+            );
+        }
+    }
+
+    private void stopPolling() {
+        if (isPollingActive.compareAndSet(true, false)) {
+            System.out.println("[POLLING] Arrêt du polling");
+            if (pollingFuture != null && !pollingFuture.isCancelled()) {
+                pollingFuture.cancel(false);
+                pollingFuture = null;
             }
-        };
-        pollingService.setPeriod(Duration.seconds(2));
-        pollingService.setOnSucceeded(event -> {
-            TurnStatusDTO dto = pollingService.getValue();
-            if (dto != null) {
-                majInterfaceAvecEtat(dto);
-            }
-        });
-        pollingService.setOnFailed(e -> System.err.println("Le polling a échoué."));
+        }
     }
 
     private void performApiCall(FarkleApiCall apiCall) {
-        stopPolling(); // On arrête le polling pendant qu'on joue
+        if (myPlayerId == null || myPlayerId == -1) {
+            afficherAlerteErreur("Joueur non initialisé", "Vous ne pouvez pas jouer tant que vous n'êtes pas inscrit.");
+            return;
+        }
+
+        // Arrêter le polling pendant notre action
+        stopPolling();
         desactiverBoutonsPendantAction();
 
         Task<TurnStatusDTO> task = new Task<>() {
-            @Override protected TurnStatusDTO call() throws ApiException { return apiCall.call(); }
+            @Override protected TurnStatusDTO call() throws ApiException {
+                return apiCall.call();
+            }
         };
 
         task.setOnSucceeded(event -> {
             TurnStatusDTO dto = task.getValue();
+            System.out.println("[ACTION] DTO reçu après action = " + resumeDto(dto));
             majInterfaceAvecEtat(dto);
-            // On relance le polling seulement si ce n'est PLUS notre tour
+
+            // Redémarrer le polling si ce n'est plus notre tour
             if (!isMyTurn(dto) && !"GAME_OVER".equals(dto.gameState)) {
-                startPolling();
+                // Petit délai avant de redémarrer pour éviter les conflits
+                pollingExecutor.schedule(() -> startPolling(), 500, TimeUnit.MILLISECONDS);
             }
         });
 
@@ -159,9 +212,12 @@ public class MainViewController {
             if (event.getSource().getException() != null) {
                 errorMessage = event.getSource().getException().getMessage();
             }
+            System.err.println("[ACTION] ERREUR : " + errorMessage);
             afficherAlerteErreur("Erreur d'action", errorMessage);
             updateActionButtons(dernierEtatRecu);
-            startPolling(); // On relance le polling même après une erreur
+
+            // Redémarrer le polling même en cas d'erreur
+            pollingExecutor.schedule(() -> startPolling(), 500, TimeUnit.MILLISECONDS);
         });
 
         new Thread(task).start();
@@ -169,25 +225,36 @@ public class MainViewController {
 
     private void majInterfaceAvecEtat(TurnStatusDTO etat) {
         if (etat == null) return;
+
+        // Détecter si l'adversaire vient de jouer pour afficher le message
+        if (!isMyTurn(etat) &&
+                dernierEtatRecu.currentPlayerId != -1 &&
+                !Objects.equals(dernierEtatRecu.currentPlayerId, etat.currentPlayerId) &&
+                etat.currentPlayerName != null) {
+            showTurnUpdateMessage(etat.currentPlayerName + " a joué !");
+        }
+
+
         this.dernierEtatRecu = etat;
+
+        System.out.println("[MAJ UI] DTO = " + resumeDto(etat));
+        System.out.println("[MAJ UI] myPlayerId = " + myPlayerId + ", currentPlayerId = " + etat.currentPlayerId +
+                ", gameState = " + etat.gameState + ", actions = " + etat.availableActions);
 
         tourLabel.setText("C'est au tour de : " + (etat.currentPlayerName != null ? etat.currentPlayerName : "En attente..."));
 
-        playerName.setText((myName != null ? myName : "Toi") + " (Vous)");
-        playerScore.setText(String.valueOf(
-                (myPlayerId != null && myPlayerId.equals(etat.currentPlayerId)) ?
-                        etat.currentPlayerScore : etat.opponentPlayerScore
-        ));
-
-        opponentName.setText(
-                (myPlayerId != null && myPlayerId.equals(etat.currentPlayerId)) ?
-                        (etat.opponentPlayerName != null ? etat.opponentPlayerName : "Adversaire") :
-                        (etat.currentPlayerName != null ? etat.currentPlayerName : "Adversaire")
-        );
-        opponentScore.setText(String.valueOf(
-                (myPlayerId != null && myPlayerId.equals(etat.currentPlayerId)) ?
-                        etat.opponentPlayerScore : etat.currentPlayerScore
-        ));
+        playerName.setText(myName + " (Vous)");
+        if (myPlayerId != null) {
+            if (myPlayerId.equals(etat.currentPlayerId)) {
+                playerScore.setText(String.valueOf(etat.currentPlayerScore));
+                opponentName.setText(etat.opponentPlayerName != null ? etat.opponentPlayerName : "Adversaire");
+                opponentScore.setText(String.valueOf(etat.opponentPlayerScore));
+            } else {
+                playerScore.setText(String.valueOf(etat.opponentPlayerScore));
+                opponentName.setText(etat.currentPlayerName != null ? etat.currentPlayerName : "Adversaire");
+                opponentScore.setText(String.valueOf(etat.currentPlayerScore));
+            }
+        }
 
         scoreLabel.setText("Score du tour : " + etat.tempScore + " 💰");
         updateCentralMessage(etat);
@@ -197,27 +264,39 @@ public class MainViewController {
         updateActionButtons(etat);
     }
 
-    private void handlerRoll() { performApiCall(() -> farkleService.lancerDes()); }
-    private void handlerBank() { performApiCall(() -> farkleService.banker()); }
+    private void showTurnUpdateMessage(String message) {
+        Platform.runLater(() -> {
+            if (turnUpdateLabel != null) {
+                turnUpdateLabel.setText(message);
+                turnUpdateLabel.setVisible(true);
+
+                PauseTransition pause = new PauseTransition(Duration.seconds(1.5));
+                pause.setOnFinished(e -> turnUpdateLabel.setVisible(false));
+                pause.play();
+            }
+        });
+    }
+
+    // ... [Le reste du code reste identique]
+
+    private void handlerRoll() {
+        System.out.println("[UI] Bouton Lancer les dés cliqué.");
+        performApiCall(() -> farkleService.lancerDes());
+    }
+
+    private void handlerBank() {
+        System.out.println("[UI] Bouton Mettre en banque cliqué.");
+        performApiCall(() -> farkleService.banker());
+    }
+
     private void handlerKeep() {
         String selection = diceViewsOnPlate.stream().filter(DieView::isSelected).map(d -> String.valueOf(d.getValue())).collect(Collectors.joining(" "));
-        if (selection.isEmpty()) { afficherAlerte("Sélection Vide", "Veuillez sélectionner les dés à garder."); return; }
+        System.out.println("[UI] Bouton Garder la sélection cliqué. Selection = '" + selection + "'");
+        if (selection.isEmpty()) {
+            afficherAlerte("Sélection Vide", "Veuillez sélectionner les dés à garder.");
+            return;
+        }
         performApiCall(() -> farkleService.selectionnerDes(selection));
-    }
-
-    private void startPolling() {
-        if (pollingService != null && !pollingService.isRunning()) {
-            Platform.runLater(() -> {
-                pollingService.reset();
-                pollingService.start();
-            });
-        }
-    }
-
-    private void stopPolling() {
-        if (pollingService != null && pollingService.isRunning()) {
-            pollingService.cancel();
-        }
     }
 
     private void updateCentralMessage(TurnStatusDTO etat) {
@@ -251,13 +330,14 @@ public class MainViewController {
         scoreLabel.setText("Score du tour : 0");
         this.dernierEtatRecu = new TurnStatusDTO();
         this.dernierEtatRecu.currentPlayerId = -1;
-        this.dernierEtatRecu.opponentPlayerId = -1;
         desactiverBoutonsPendantAction();
+        System.out.println("[UI] resetUIForNewGame() appelée");
     }
 
     private void updateActionButtons(TurnStatusDTO etat) {
         if (etat == null || "GAME_OVER".equals(etat.gameState)) {
             desactiverBoutonsPendantAction();
+            System.out.println("[UI] Action buttons désactivés (fin de partie ou état null)");
             return;
         }
         List<String> actions = etat.availableActions != null ? etat.availableActions : Collections.emptyList();
@@ -266,6 +346,7 @@ public class MainViewController {
         long nbDesSelect = diceViewsOnPlate.stream().filter(DieView::isSelected).count();
         btnBank.setDisable(!estMonTour || !actions.contains("BANK"));
         btnKeep.setDisable(!estMonTour || !actions.contains("SELECT_DICE") || nbDesSelect == 0);
+        System.out.println("[UI] updateActionButtons : estMonTour = " + estMonTour + ", actions = " + actions + ", nbDesSelect = " + nbDesSelect);
     }
 
     @FunctionalInterface private interface FarkleApiCall { TurnStatusDTO call() throws ApiException; }
@@ -320,8 +401,19 @@ public class MainViewController {
         public boolean isSelected() { return selected; }
     }
 
-    private void afficherAlerte(String titre, String message) { Platform.runLater(() -> { Alert alert = new Alert(Alert.AlertType.INFORMATION, message); alert.setTitle(titre); alert.setHeaderText(null); alert.showAndWait(); }); }
-    private void afficherAlerteErreur(String titre, String message) { Platform.runLater(() -> { Alert alert = new Alert(Alert.AlertType.ERROR, message); alert.setTitle(titre); alert.setHeaderText(null); alert.showAndWait(); }); }
+    private void afficherAlerte(String titre, String message) {
+        Platform.runLater(() -> {
+            Alert alert = new Alert(Alert.AlertType.INFORMATION, message);
+            alert.setTitle(titre); alert.setHeaderText(null); alert.showAndWait();
+        });
+    }
+
+    private void afficherAlerteErreur(String titre, String message) {
+        Platform.runLater(() -> {
+            Alert alert = new Alert(Alert.AlertType.ERROR, message);
+            alert.setTitle(titre); alert.setHeaderText(null); alert.showAndWait();
+        });
+    }
 
     private void setupComboTable() {
         colCombo.setCellValueFactory(data -> new javafx.beans.property.SimpleStringProperty(data.getValue().get("combo")));
@@ -337,10 +429,23 @@ public class MainViewController {
         );
         comboTable.setItems(this.defaultScoreRules);
     }
+
     private Map<String, String> createScoreRow(String combo, String points) {
         Map<String, String> row = new HashMap<>();
         row.put("combo", combo);
         row.put("points", points + " pts");
         return row;
+    }
+
+    private String resumeDto(TurnStatusDTO dto) {
+        return "{gameState=" + dto.gameState +
+                ", currentPlayerId=" + dto.currentPlayerId +
+                ", currentPlayerName=" + dto.currentPlayerName +
+                ", opponentPlayerName=" + dto.opponentPlayerName +
+                ", actions=" + dto.availableActions +
+                ", diceOnPlate=" + dto.diceOnPlate +
+                ", keptDiceThisTurn=" + dto.keptDiceThisTurn +
+                ", tempScore=" + dto.tempScore +
+                "}";
     }
 }
