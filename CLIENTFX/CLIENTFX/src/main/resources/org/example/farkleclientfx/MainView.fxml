@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Imports nécessaires pour les composants JavaFX -->
+<?import javafx.geometry.Insets?>
+<?import javafx.scene.control.*?>
+<?import javafx.scene.image.ImageView?>
+<?import javafx.scene.layout.*?>
+
+<!-- Racine de la scène : StackPane -->
+<StackPane styleClass="root-pane" xmlns:fx="http://javafx.com/fxml" fx:controller="org.example.farkleclientfx.MainViewController">
+    <!-- Le layout principal de la fenêtre : BorderPane -->
+    <BorderPane>
+        <!-- Barre du haut : affiche de qui c'est le tour -->
+        <top>
+            <Label fx:id="tourLabel"
+                   alignment="CENTER"
+                   maxWidth="Infinity"
+                   styleClass="tour-label"
+                   text="Initialisation..."/>
+        </top>
+        <!-- Centre de la fenêtre : le cœur de l’interface de jeu -->
+        <center>
+            <VBox alignment="CENTER" spacing="15" style="-fx-padding: 20;">
+                <!-- Zone principale contenant les dés, messages et boutons -->
+                <VBox alignment="CENTER" spacing="15" styleClass="dice-area" VBox.vgrow="ALWAYS">
+                    <!-- Padding intérieur pour un rendu visuel agréable -->
+                    <padding><Insets bottom="20.0" left="20.0" right="20.0" top="20.0"/></padding>
+                    <!-- Ligne joueurs (gauche/droite) avec avatars et scores -->
+                    <BorderPane>
+                        <padding><Insets bottom="15.0" left="20.0" right="20.0" /></padding>
+                        <left>
+                            <VBox fx:id="playerPanel" alignment="CENTER" spacing="5" styleClass="player-panel">
+                                <ImageView fx:id="playerAvatar" fitHeight="80.0" fitWidth="80.0" pickOnBounds="true" preserveRatio="true" />
+                                <Label fx:id="playerName" styleClass="name-label" text="Toi"/>
+                                <Label fx:id="playerScore" styleClass="score-label" text="0"/>
+                            </VBox>
+                        </left>
+                        <right>
+                            <VBox fx:id="opponentPanel" alignment="CENTER" spacing="5" styleClass="player-panel">
+                                <ImageView fx:id="opponentAvatar" fitHeight="80.0" fitWidth="80.0" pickOnBounds="true" preserveRatio="true" />
+                                <Label fx:id="opponentName" styleClass="name-label" text="Adversaire"/>
+                                <Label fx:id="opponentScore" styleClass="score-label" text="0"/>
+                            </VBox>
+                        </right>
+                    </BorderPane>
+                    <Separator/>
+                    <!-- Message central dynamique (par ex : “À vous de jouer !”) -->
+                    <Label fx:id="messageBoxLabel" styleClass="message-box-label" text="Prêt à jouer ?"/>
+                    <!-- Affichage des dés à lancer -->
+                    <HBox fx:id="diceBox" alignment="CENTER" minHeight="50.0" spacing="10.0"/>
+                    <!-- Score temporaire du tour en cours -->
+                    <Label fx:id="scoreLabel" styleClass="turn-score-label" text="Score du tour : 0"/>
+                    <!-- Affichage des dés gardés -->
+                    <HBox fx:id="keptDiceBox" alignment="CENTER" minHeight="50.0" spacing="10.0"/>
+                    <!-- Boutons d’action du tour : lancer, garder, banker -->
+                    <HBox alignment="CENTER" spacing="20" style="-fx-padding: 15 0 0 0;">
+                        <Button fx:id="btnRoll" text="Lancer les dés"/>
+                        <Button fx:id="btnKeep" text="Garder la sélection"/>
+                        <Button fx:id="btnBank" text="Mettre en banque"/>
+                    </HBox>
+                </VBox>
+            </VBox>
+        </center>
+        <!-- Colonne de droite : infos sur les combinaisons de points -->
+        <right>
+            <VBox spacing="10" style="-fx-padding: 10 15 10 5;">
+                <TitledPane styleClass="info-pane" text="Valeurs des combinaisons">
+                    <TableView fx:id="comboTable" prefHeight="600.0">
+                        <columns>
+                            <TableColumn fx:id="colCombo" prefWidth="150.0" text="Combinaison"/>
+                            <TableColumn fx:id="colPoints" prefWidth="75.0" text="Valeur"/>
+                        </columns>
+                    </TableView>
+                </TitledPane>
+            </VBox>
+        </right>
+        <!-- Bas de la fenêtre : boutons généraux -->
+        <bottom>
+            <HBox alignment="CENTER_RIGHT" spacing="20" style="-fx-padding: 0 20 10 0;">
+                <Button fx:id="btnQuit" text="Quitter le Jeu" styleClass="yellow-button"/>
+
+            </HBox>
+        </bottom>
+    </BorderPane>
+</StackPane>
