@@ -79,34 +79,47 @@ public class GameManager {
     public TurnStatusDTO roll() {
         if (!isGameReady()) return waitingForPlayersDTO();
 
+        // Logs de début d'action
         System.out.println("=== [DEBUG] ROLL demandé ===");
         System.out.println("Etat initial : currentPlayer = " + (currentPlayer != null ? currentPlayer.getName() : "null"));
         System.out.println("Dice avant roll : " + (currentTurn != null ? currentTurn.getDiceOnPlate() : "null"));
+
         TurnStatusDTO dto = createBaseDTO();
         if (!isActionValidForCurrentPlayer(dto)) return dto;
 
+        // Logique pour le lancer et le Hot Dice
         if (currentTurn.isHotDiceChoicePending()) {
             dto.turnEvents.addAll(currentTurn.resolveHotDiceChoice(false));
-            if (currentTurn.canPlayerRoll()) {
-                dto.turnEvents.addAll(currentTurn.rollDiceAndEvaluate());
-            }
-        } else {
-            dto.turnEvents.addAll(currentTurn.rollDiceAndEvaluate());
-            System.out.println("Dice après roll : " + currentTurn.getDiceOnPlate());
-            System.out.println("Temp score après roll : " + currentTurn.getTemporaryScore());
         }
+        dto.turnEvents.addAll(currentTurn.rollDiceAndEvaluate());
 
-        // *** SEULEMENT APRÈS UN FARKLE on passe la main ***
-        if (currentTurn.isFarkle()) {
-            dto.gameState = "FARKLE_TURN_ENDED";
-            dto.immersiveMessage = Messages.randomFarkle();
-            switchPlayer();
-        }
+        // Logs de milieu d'action
+        System.out.println("Dice après roll : " + currentTurn.getDiceOnPlate());
+        System.out.println("Temp score après roll : " + currentTurn.getTemporaryScore());
+
         stateChangedFlag = true;
 
-        System.out.println("[DEBUG] Avant return roll → gameState = " + dto.gameState + ", tempScore = " + dto.tempScore);
+        // Version finale et correcte de la gestion du Farkle
+        if (currentTurn.isFarkle()) {
+            System.out.println("[DEBUG] FARKLE détecté ! Préparation de la réponse AVANT de changer de joueur.");
+            dto.gameState = "FARKLE_TURN_ENDED";
+            dto.immersiveMessage = Messages.randomFarkle();
+
+            // 1. On construit la réponse finale
+            TurnStatusDTO finalDto = finalizeDTO(dto);
+
+            // 2. ENSUITE, on change de joueur
+            switchPlayer();
+
+            // 3. On renvoie la réponse du Farkle
+            return finalDto;
+        }
+
+        // S'il n'y a PAS de Farkle, on renvoie la réponse normalement.
+        System.out.println("[DEBUG] Pas de Farkle, préparation de la réponse normale.");
         return finalizeDTO(dto);
     }
+
 
     public TurnStatusDTO select(String diceValuesInput) {
         if (!isGameReady()) return waitingForPlayersDTO();
@@ -248,19 +261,39 @@ public class GameManager {
             dto.availableActions = new ArrayList<>();
             if (currentTurn.isHotDiceChoicePending()) {
                 dto.gameState = "HOT_DICE_CHOICE";
-                dto.immersiveMessage = "HOT DICE ! Relancer ou sécuriser " + dto.tempScore + " pts ?";
-                dto.availableActions.addAll(Arrays.asList("CHOOSE_HOT_DICE_BANK", "CHOOSE_HOT_DICE_ROLL"));
-            } else if (currentTurn.canPlayerSelect()) {
-                dto.gameState = "POST_ROLL_CHOICE";
-                dto.immersiveMessage = "Quels trésors vas-tu garder ?";
-                dto.availableActions.add("SELECT_DICE");
-            } else if (currentTurn.canPlayerRoll()) {
-                dto.gameState = "POST_SELECTION_CHOICE";
-                dto.immersiveMessage = Messages.randomNewRoll();
+                dto.immersiveMessage = "HOT DICE ! Relance les 6 dés ou sécurise tes " + dto.tempScore + " points !";
+                // On envoie les noms d'action standards que le client connaît déjà
                 dto.availableActions.add("ROLL");
-            }
-            if (currentTurn.canPlayerBank()) {
                 dto.availableActions.add("BANK");
+            }
+            // Si ce n'est pas un Hot Dice, on applique la logique normale
+            else {
+                // Règle 1 : Début d'un nouveau tour (on ne peut que lancer)
+                if (currentTurn.canPlayerRoll() && currentTurn.getKeptDiceThisTurn().isEmpty()) {
+                    dto.gameState = "BEGIN_TURN";
+                    if (dto.immersiveMessage == null || dto.immersiveMessage.isEmpty()) {
+                        dto.immersiveMessage = Messages.randomNewRoll();
+                    }
+
+                    dto.availableActions.add("ROLL");
+                }
+                // Règle 2 : Après un lancer (on doit sélectionner)
+                else if (currentTurn.canPlayerSelect()) {
+                    dto.gameState = "POST_ROLL_CHOICE";
+                    dto.immersiveMessage = "Quels trésors vas-tu garder ?";
+                    dto.availableActions.add("SELECT_DICE");
+                }
+                // Règle 3 : Après une sélection (on peut relancer)
+                else if (currentTurn.canPlayerRoll() && !currentTurn.getKeptDiceThisTurn().isEmpty()) {
+                    dto.gameState = "POST_SELECTION_CHOICE";
+                    dto.immersiveMessage = Messages.randomNewRoll();
+                    dto.availableActions.add("ROLL");
+                }
+
+                // Règle générale : On peut toujours mettre en banque si on a des points temporaires
+                if (currentTurn.canPlayerBank()) {
+                    dto.availableActions.add("BANK");
+                }
             }
         } else {
             dto.gameState = "WAITING_FOR_PLAYERS";

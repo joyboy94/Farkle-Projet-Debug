@@ -23,65 +23,93 @@ public class ScoreCalculator {
         if (dice == null || dice.isEmpty()) {
             return 0;
         }
-        Map<Integer, Long> counts = dice.stream()
-                .collect(Collectors.groupingBy(Dice::getValue, Collectors.counting()));
-        int totalPoints = 0;
-        Map<Integer, Long> mutableCounts = new HashMap<>(counts);
 
-        // 1. Suite complète 1-6 (6 dés)
-        if (dice.size() == 6 && mutableCounts.keySet().size() == 6 &&
-                mutableCounts.values().stream().allMatch(c -> c == 1)) {
-            return SCORE_STRAIGHT_1_6;
-        }
-        // 2. Trois paires (6 dés)
-        if (dice.size() == 6 && mutableCounts.values().stream().filter(c -> c == 2).count() == 3) {
-            return SCORE_THREE_PAIRS;
-        }
-        // 3. Six identiques
-        for (int value = 1; value <= 6; value++) {
-            if (mutableCounts.getOrDefault(value, 0L) == 6) {
-                return SCORE_SIX_OF_A_KIND; // Utilise tous les dés, score unique
-            }
+        int[] counts = new int[7]; // Index 1 à 6 pour les valeurs des dés
+        for (Dice d : dice) {
+            counts[d.getValue()]++;
         }
 
-        // Combinaisons N-of-a-kind (ne consomment pas forcément tous les dés de la liste fournie)
-        for (int value = 1; value <= 6; value++) {
-            long count = mutableCounts.getOrDefault(value, 0L);
-            if (count >= 5) { // Cinq identiques (plus prioritaire que brelan si 5 sont fournis)
-                totalPoints += SCORE_FIVE_OF_A_KIND;
-                mutableCounts.put(value, 0L); // Consomme ces dés pour le calcul des 1 et 5
-            } else if (count >= 4) { // Quatre identiques
-                totalPoints += SCORE_FOUR_OF_A_KIND;
-                mutableCounts.put(value, 0L);
-            } else if (count >= 3) { // Trois identiques
-                totalPoints += (value == 1) ? SCORE_TRIPLE_1 : value * SCORE_TRIPLE_OTHERS_MULTIPLIER;
-                mutableCounts.put(value, mutableCounts.get(value) - 3);
+        int points = 0;
+
+        // Suite complète 1-2-3-4-5-6 (doit utiliser 6 dés)
+        boolean isStraight = dice.size() == 6;
+        if (isStraight) {
+            for (int i = 1; i <= 6; i++) {
+                if (counts[i] != 1) {
+                    isStraight = false;
+                    break;
+                }
             }
+            if (isStraight) return SCORE_STRAIGHT_1_6;
         }
+
+        // Trois paires (doit utiliser 6 dés)
+        if (dice.size() == 6) {
+            int pairCount = 0;
+            for (int c : counts) {
+                if (c == 2) pairCount++;
+            }
+            if (pairCount == 3) return SCORE_THREE_PAIRS;
+        }
+
+        // Six, cinq, quatre dés identiques
+        for (int i = 1; i <= 6; i++) {
+            if (counts[i] >= 6) { points += SCORE_SIX_OF_A_KIND; counts[i] -= 6; }
+            else if (counts[i] >= 5) { points += SCORE_FIVE_OF_A_KIND; counts[i] -= 5; }
+            else if (counts[i] >= 4) { points += SCORE_FOUR_OF_A_KIND; counts[i] -= 4; }
+        }
+
+        // Trois dés identiques
+        if (counts[1] >= 3) { points += SCORE_TRIPLE_1; counts[1] -= 3; }
+        for (int i = 2; i <= 6; i++) {
+            if (counts[i] >= 3) { points += i * SCORE_TRIPLE_OTHERS_MULTIPLIER; counts[i] -= 3; }
+        }
+
         // Dés individuels restants
-        totalPoints += mutableCounts.getOrDefault(1, 0L) * SCORE_SINGLE_1;
-        totalPoints += mutableCounts.getOrDefault(5, 0L) * SCORE_SINGLE_5;
-        return totalPoints;
+        points += counts[1] * SCORE_SINGLE_1;
+        points += counts[5] * SCORE_SINGLE_5;
+
+        return points;
     }
-
     public List<Dice> findScoringDice(List<Dice> diceList) {
-        if (diceList == null || diceList.isEmpty()) return new ArrayList<>();
+        if (diceList == null || diceList.isEmpty()) {
+            return new ArrayList<>();
+        }
+
         Set<Dice> scoringDiceSet = new HashSet<>();
-        Map<Integer, Long> counts = diceList.stream().collect(Collectors.groupingBy(Dice::getValue, Collectors.counting()));
+        Map<Integer, List<Dice>> diceByValue = diceList.stream()
+                .collect(Collectors.groupingBy(Dice::getValue));
 
-        if (isHotDiceSpecialCombo(diceList)) return new ArrayList<>(diceList); // Si c'est une combo spéciale, tous les dés scorent
-
-        for (int value = 1; value <= 6; value++) {
-            final int v = value; // Ajoute ceci
-            if (counts.getOrDefault(v, 0L) >= 3) {
-                diceList.stream()
-                        .filter(d -> d.getValue() == v) // Utilise 'v' ici !
-                        .forEach(scoringDiceSet::add);
+        // --- Règle 1 : Vérifier les combinaisons spéciales qui utilisent les 6 dés ---
+        if (diceList.size() == 6) {
+            // Cas 1.1 : Trois paires (ex: 2,2, 4,4, 5,5)
+            long pairCount = diceByValue.values().stream().filter(list -> list.size() == 2).count();
+            if (pairCount == 3) {
+                return new ArrayList<>(diceList); // Tous les dés scorent
+            }
+            // Cas 1.2 : Suite complète (1,2,3,4,5,6)
+            if (diceByValue.size() == 6) {
+                return new ArrayList<>(diceList); // Tous les dés scorent
             }
         }
 
-        diceList.stream().filter(d -> d.getValue() == 1).forEach(scoringDiceSet::add);
-        diceList.stream().filter(d -> d.getValue() == 5).forEach(scoringDiceSet::add);
+        // --- Règle 2 : Chercher les brelans (ou plus) pour chaque valeur ---
+        for (List<Dice> group : diceByValue.values()) {
+            if (group.size() >= 3) {
+                scoringDiceSet.addAll(group); // Si brelan, carré, etc., tous les dés de cette valeur scorent
+            }
+        }
+
+        // --- Règle 3 : Chercher les [1] et [5] individuels ---
+        // On ajoute les 1 qui ne font pas déjà partie d'un brelan+
+        if (diceByValue.containsKey(1) && diceByValue.get(1).size() < 3) {
+            scoringDiceSet.addAll(diceByValue.get(1));
+        }
+        // On ajoute les 5 qui ne font pas déjà partie d'un brelan+
+        if (diceByValue.containsKey(5) && diceByValue.get(5).size() < 3) {
+            scoringDiceSet.addAll(diceByValue.get(5));
+        }
+
         return new ArrayList<>(scoringDiceSet);
     }
 

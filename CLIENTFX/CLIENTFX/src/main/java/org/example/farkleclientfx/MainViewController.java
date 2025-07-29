@@ -125,47 +125,31 @@ public class MainViewController {
 
     private void startPolling() {
         if (isPollingActive.compareAndSet(false, true)) {
-            System.out.println("[POLLING] Démarrage du polling");
+            System.out.println("[POLLING] Démarrage du polling (mode contournement)");
 
-            // Tâche de polling qui s'exécute toutes les 2 secondes
             Runnable pollingTask = () -> {
                 try {
-                    // Vérifier si l'état a changé
-                    Integer stateChanged = farkleService.getState();
-                    System.out.println("[POLL] /stateChanged → " + stateChanged);
+                    // ON IGNORE /stateChanged ET ON RÉCUPÈRE TOUJOURS L'ÉTAT COMPLET
+                    // C'est la seule façon d'éviter la race condition.
+                    TurnStatusDTO newState = farkleService.getEtatCompose();
 
-                    if (stateChanged == 1) {
-                        // Si changement, récupérer l'état complet
-                        System.out.println("[POLL] Changement détecté, appel /banker");
-                        TurnStatusDTO newState = farkleService.banker();
-
-                        // Mettre à jour l'UI dans le thread JavaFX
+                    // On met à jour l'UI uniquement si l'état a réellement changé
+                    // pour éviter de rafraîchir l'écran inutilement.
+                    if (newState != null && !newState.equals(dernierEtatRecu)) {
                         Platform.runLater(() -> {
                             majInterfaceAvecEtat(newState);
 
-                            // Si la partie a commencé et ce n'est pas notre tour, continuer le polling
-                            // Si c'est notre tour ou si la partie est terminée, arrêter
-                            if ("GAME_OVER".equals(newState.gameState) ||
-                                    (!"WAITING_FOR_PLAYERS".equals(newState.gameState) && isMyTurn(newState))) {
+                            if ("GAME_OVER".equals(newState.gameState) || isMyTurn(newState)) {
                                 stopPolling();
                             }
                         });
                     }
-                } catch (ApiException e) {
-                    System.err.println("[POLL] Erreur API : " + e.getMessage());
                 } catch (Exception e) {
-                    System.err.println("[POLL] Erreur inattendue : " + e.getMessage());
-                    e.printStackTrace();
+                    System.err.println("[POLL] Erreur, arrêt du polling : " + e.getMessage());
+                    Platform.runLater(this::stopPolling);
                 }
             };
-
-            // Planifier l'exécution périodique (toutes les 2 secondes)
-            pollingFuture = pollingExecutor.scheduleAtFixedRate(
-                    pollingTask,
-                    0,              // Délai initial (0 = démarrage immédiat)
-                    2,              // Période
-                    TimeUnit.SECONDS
-            );
+            pollingFuture = pollingExecutor.scheduleAtFixedRate(pollingTask, 0, 2, TimeUnit.SECONDS);
         }
     }
 
@@ -199,12 +183,12 @@ public class MainViewController {
             TurnStatusDTO dto = task.getValue();
             System.out.println("[ACTION] DTO reçu après action = " + resumeDto(dto));
             majInterfaceAvecEtat(dto);
-
-            // Redémarrer le polling si ce n'est plus notre tour
-            if (!isMyTurn(dto) && !"GAME_OVER".equals(dto.gameState)) {
-                // Petit délai avant de redémarrer pour éviter les conflits
-                pollingExecutor.schedule(() -> startPolling(), 500, TimeUnit.MILLISECONDS);
+            if (!"FARKLE_TURN_ENDED".equals(dto.gameState)) {
+                if (!isMyTurn(dto) && !"GAME_OVER".equals(dto.gameState)) {
+                    pollingExecutor.schedule(() -> startPolling(), 500, TimeUnit.MILLISECONDS);
+                }
             }
+
         });
 
         task.setOnFailed(event -> {
@@ -226,6 +210,36 @@ public class MainViewController {
     private void majInterfaceAvecEtat(TurnStatusDTO etat) {
         if (etat == null) return;
 
+        final TurnStatusDTO etatFinal = etat;
+
+        // Cas spécial : Si un Farkle se produit, on le gère en priorité
+        if ("FARKLE_TURN_ENDED".equals(etat.gameState)) {
+            System.out.println("[UI] Événement FARKLE détecté ! Affichage et pause.");
+            stopPolling();
+            // On mémorise l'état du Farkle MAINTENANT
+            this.dernierEtatRecu = etat;
+
+            // On met à jour l'interface pour montrer l'état du Farkle
+            messageBoxLabel.setText(etat.immersiveMessage);
+            if (etat.diceOnPlate != null) {
+                afficherDes(etat.diceOnPlate);
+            }
+            desactiverBoutonsPendantAction();
+
+            PauseTransition pause = new PauseTransition(Duration.seconds(3.5));
+            pause.setOnFinished(e -> {
+                System.out.println("[UI] Fin de la pause Farkle, reprise du polling.");
+                startPolling();
+            });
+            pause.play();
+            return; // On arrête tout ici.
+        }
+
+        // Si on n'est pas dans un Farkle, on continue
+        if (etat.availableActions == null || etat.availableActions.isEmpty()) {
+            etat = enrichirDtoCoteClient(etat);
+        }
+
         // Détecter si l'adversaire vient de jouer pour afficher le message
         if (!isMyTurn(etat) &&
                 dernierEtatRecu.currentPlayerId != -1 &&
@@ -233,7 +247,6 @@ public class MainViewController {
                 etat.currentPlayerName != null) {
             showTurnUpdateMessage(etat.currentPlayerName + " a joué !");
         }
-
 
         this.dernierEtatRecu = etat;
 
@@ -261,9 +274,43 @@ public class MainViewController {
         if (etat.diceOnPlate != null) afficherDes(etat.diceOnPlate);
         if (etat.keptDiceThisTurn != null) afficherDesGardes(etat.keptDiceThisTurn);
 
+        // On met à jour la table des combinaisons avec les indices du serveur.
+        if (etat.combinationHints != null && !etat.combinationHints.isEmpty()) {
+            comboTable.setItems(FXCollections.observableArrayList(etat.combinationHints));
+        } else {
+            comboTable.setItems(defaultScoreRules);
+        }
         updateActionButtons(etat);
     }
+    private TurnStatusDTO enrichirDtoCoteClient(TurnStatusDTO etatPartiel) {
+        etatPartiel.availableActions = new ArrayList<>();
 
+        if (etatPartiel.currentPlayerId != -1 && !"GAME_OVER".equals(etatPartiel.gameState)) {
+
+            // Règle CLÉ : Si aucun dé n'a été gardé ET que le score du tour est à zéro,
+            // c'est forcément un début de tour (ou une relance après un Farkle).
+            // L'action principale est de lancer les dés.
+            if (etatPartiel.keptDiceThisTurn.isEmpty() && etatPartiel.tempScore == 0) {
+                etatPartiel.availableActions.add("ROLL");
+            }
+            // Dans tous les autres cas d'un tour en cours...
+            else {
+                // S'il y a des dés sur le plateau, on peut les sélectionner.
+                if (etatPartiel.diceOnPlate != null && !etatPartiel.diceOnPlate.isEmpty()) {
+                    etatPartiel.availableActions.add("SELECT_DICE");
+                }
+                // On peut relancer les dés restants.
+                etatPartiel.availableActions.add("ROLL");
+                // On peut mettre en banque si on a des points.
+                if (etatPartiel.tempScore > 0){
+                    etatPartiel.availableActions.add("BANK");
+                }
+            }
+        }
+
+        System.out.println("[CLIENT-LOGIC] Actions déduites pour l'état actuel : " + etatPartiel.availableActions);
+        return etatPartiel;
+    }
     private void showTurnUpdateMessage(String message) {
         Platform.runLater(() -> {
             if (turnUpdateLabel != null) {

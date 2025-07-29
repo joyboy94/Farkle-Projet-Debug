@@ -95,15 +95,18 @@ public class Turn {
         // Si aucun score possible => Farkle !
         if (allScoringInRoll.isEmpty()) {
             farkleTriggered = true;
-            temporaryScore = 0;
+            this.temporaryScore = 0; // On efface les points accumulés PENDANT ce tour.
+
             events.add(ServerMessages.farkle());
-            canRollAction = false; canSelectAction = false; canBankAction = false;
+            canRollAction = false;
+            canSelectAction = false;
+            canBankAction = false;
         } else {
             canSelectAction = true;
             canRollAction = false;
             canBankAction = true;
 
-            // Tous les dés sont scorants ? ⇒ Hot Dice !
+            // Tous les dés sont scorants ? ⇒ Hot Dice
             if (allScoringInRoll.size() == diceOnPlate.size()) {
                 int gained = scoreCalculator.calculatePoints(diceOnPlate);
                 temporaryScore += gained;
@@ -146,58 +149,48 @@ public class Turn {
             return events;
         }
 
-        // Récupère la sélection utilisateur (liste d'objets Dice)
         List<Dice> playerSelectedDice = parseSelectedDice(inputValues, diceOnPlate);
 
-        // Validation rapide de la sélection (existence + scorable)
-        if (playerSelectedDice == null || playerSelectedDice.isEmpty() || !scoreCalculator.isValidSelection(playerSelectedDice, diceOnPlate)) {
-            events.add(ServerMessages.invalidSelection());
+        if (playerSelectedDice == null || playerSelectedDice.isEmpty()) {
+            events.add(ServerMessages.invalidSelection() + " (Aucun dé valide sélectionné).");
             return events;
         }
 
+        // --- DÉBUT DE LA VALIDATION STRICTE ---
+
+        // 1. On trouve tous les dés réellement scorants PARMI la sélection du joueur.
+        List<Dice> scoringDiceInSelection = scoreCalculator.findScoringDice(playerSelectedDice);
+
+        // 2. On vérifie que TOUS les dés sélectionnés sont bien des dés scorants.
+        // Si le nombre de dés sélectionnés est différent du nombre de dés scorants trouvés,
+        // alors la sélection contient au moins un dé non scorable.
+        if (scoringDiceInSelection.size() != playerSelectedDice.size()) {
+            events.add(ServerMessages.invalidSelection() + " (Vous ne pouvez garder que des dés ou des combinaisons qui rapportent des points).");
+            return events; // On rejette la sélection.
+        }
+
+        // --- FIN DE LA VALIDATION STRICTE ---
+
+        // Si on arrive ici, la sélection est 100% valide.
         int gained = scoreCalculator.calculatePoints(playerSelectedDice);
-        if (gained == 0) {
-            events.add(ServerMessages.invalidSelection() + " (Votre sélection ne rapporte aucun point).");
-            return events;
-        }
-
-        // Vérifie que chaque dé sélectionné fait partie des scorables
-        List<Dice> allScoringOnPlate = scoreCalculator.findScoringDice(diceOnPlate);
-        for (Dice selected : playerSelectedDice) {
-            boolean isPresentInScoring = false;
-            for (Dice scoringDie : allScoringOnPlate) {
-                if (selected == scoringDie) { // Comparaison par référence
-                    isPresentInScoring = true;
-                    break;
-                }
-            }
-            if (!isPresentInScoring) {
-                events.add(ServerMessages.invalidSelection() + " (Le dé [" + selected.getValue() + "] n'est pas un choix scorable pour ce lancer).");
-                return events;
-            }
-        }
-
-        // Met à jour le score temporaire et la liste des dés gardés
         temporaryScore += gained;
-        events.add(ServerMessages.diceKept(formatDiceValues(playerSelectedDice), gained));
-        keptDiceThisTurn.addAll(playerSelectedDice);
 
-        // Retire ces dés du plateau
+        keptDiceThisTurn.addAll(playerSelectedDice);
         for (Dice selectedDie : playerSelectedDice) {
             diceOnPlate.remove(selectedDie);
         }
+        events.add(ServerMessages.diceKept(formatDiceValues(playerSelectedDice), gained));
 
-        canBankAction = true;
+        // Mise à jour de l'état pour la suite du tour...
         canSelectAction = false;
-
-        // Si tous les dés ont été gardés, c’est un Hot Dice (relance potentielle)
+        canBankAction = true;
         if (diceOnPlate.isEmpty()) {
-            events.add(ServerMessages.hotDiceGeneric() + " (tous les dés utilisés) !");
             hotDiceChoicePending = true;
             canRollAction = false;
         } else {
             canRollAction = true;
         }
+
         return events;
     }
 
