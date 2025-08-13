@@ -144,10 +144,13 @@
 
 /* Style pour le label superposé qui annonce le changement de tour. */
 .turn-update-label {
-    -fx-background-color: rgba(0, 0, 0, 0.7);
-    -fx-text-fill: white;
-    -fx-font-size: 32px;
-    -fx-padding: 15px 30px;
-    -fx-background-radius: 8;
-    -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.5), 10, 0, 0, 3);
+    -fx-background-color: rgba(25, 42, 54, 0.90); /* Fond bleu foncé, plus opaque */
+    -fx-text-fill: #f1c40f; /* Texte couleur or, comme les scores */
+    -fx-font-size: 28px; /* Police légèrement plus petite pour moins d'agressivité */
+    -fx-padding: 12px 25px; /* Marge intérieure ajustée */
+    -fx-background-radius: 12; /* Coins plus arrondis */
+    -fx-border-radius: 12; /* Rayon de la bordure */
+    -fx-border-color: #f1c40f; /* Bordure couleur or */
+    -fx-border-width: 1.5px;
+    -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.7), 15, 0, 0, 4); /* Ombre plus prononcée */
 }

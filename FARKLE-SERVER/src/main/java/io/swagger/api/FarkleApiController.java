@@ -17,6 +17,10 @@ import org.springframework.web.bind.annotation.RestController;
 
 import javax.validation.Valid;
 
+/**
+ * Contrôleur REST pour l'API Farkle
+ * Version avec logs améliorés pour le suivi du respect des exigences
+ */
 @RestController
 @RequestMapping("/farkle")
 public class FarkleApiController implements FarkleApi {
@@ -29,104 +33,128 @@ public class FarkleApiController implements FarkleApi {
     public FarkleApiController(ObjectMapper objectMapper, GameManager gameManager) {
         this.objectMapper = objectMapper;
         this.gameManager = gameManager;
-        log.info("FarkleApiController initialisé avec GameManager injecté.");
+        log.info("=== FarkleApiController initialisé (version conforme aux exigences) ===");
     }
-
-    // Toutes les méthodes ci-dessous correspondent aux routes REST "/farkle/xxxx"
-    // Le préfixe "/farkle" vient de @RequestMapping de classe, et chaque méthode a le chemin relatif
-
 
     @Override
     public ResponseEntity<RestPlayer> name(@Valid @RequestParam(value = "name", required = false) String name) {
-        log.info("Requête /name reçue pour : {}", name);
+        log.info("[API] POST /farkle/name - Inscription du joueur: {}", name);
         RestPlayer restPlayer = gameManager.addPlayer(name);
         if (restPlayer != null) {
+            log.info("[API] Joueur inscrit avec succès: {} (ID={})", restPlayer.getName(), restPlayer.getId());
             return new ResponseEntity<>(restPlayer, HttpStatus.OK);
         } else {
+            log.warn("[API] Inscription refusée (partie complète)");
             return new ResponseEntity<>(HttpStatus.FORBIDDEN);
         }
     }
 
     @Override
     public ResponseEntity<String> roll() {
-        log.info("Requête /roll reçue pour le joueur ID: {}", gameManager.getCurrentPlayerId());
+        log.info("[API] POST /farkle/roll - Joueur ID={}", gameManager.getCurrentPlayerId());
         TurnStatusDTO dto = gameManager.roll();
-        return ResponseEntity.ok(toJson(dto));
+        String response = toJson(dto);
+        log.debug("[API] Réponse roll: {}", response);
+        return ResponseEntity.ok(response);
     }
 
     @Override
     public ResponseEntity<String> select(@Valid @RequestParam(value = "dices", required = false) String dices) {
-        log.info("Requête /select reçue avec les dés : {} pour le joueur ID: {}", dices, gameManager.getCurrentPlayerId());
+        log.info("[API] POST /farkle/select - Dés sélectionnés: '{}' par joueur ID={}",
+                dices, gameManager.getCurrentPlayerId());
         TurnStatusDTO dto = gameManager.select(dices);
-        return ResponseEntity.ok(toJson(dto));
+        String response = toJson(dto);
+        log.debug("[API] Réponse select: {}", response);
+        return ResponseEntity.ok(response);
     }
 
     @Override
     public ResponseEntity<String> bank() {
-        log.info("Requête /bank reçue pour le joueur ID: {}", gameManager.getCurrentPlayerId());
+        log.info("[API] POST /farkle/bank - Joueur ID={}", gameManager.getCurrentPlayerId());
         TurnStatusDTO dto = gameManager.bank();
-        return ResponseEntity.ok(toJson(dto));
+        String response = toJson(dto);
+        log.debug("[API] Réponse bank: {}", response);
+        return ResponseEntity.ok(response);
     }
 
     @Override
     public ResponseEntity<String> quit(@Valid @RequestParam(value = "playerId", required = false) Integer playerId) {
-        log.info("Requête /quit reçue pour playerId: {}", playerId);
+        log.info("[API] POST /farkle/quit - Joueur ID={} quitte", playerId);
         gameManager.quit(playerId);
         return ResponseEntity.ok(toJson(gameManager.getGameState()));
     }
 
     @Override
     public ResponseEntity<Integer> getActualTurnPoints() {
-        return ResponseEntity.ok(gameManager.getActualTurnPoints());
+        int points = gameManager.getActualTurnPoints();
+        log.debug("[API] GET /farkle/actualTurnPoints -> {}", points);
+        return ResponseEntity.ok(points);
     }
 
     @Override
     public ResponseEntity<Integer> getCurrentPlayerID() {
-        return ResponseEntity.ok(gameManager.getCurrentPlayerId());
+        int id = gameManager.getCurrentPlayerId();
+        log.debug("[API] GET /farkle/currentPlayerId -> {}", id);
+        return ResponseEntity.ok(id);
     }
 
     @Override
     public ResponseEntity<RestDices> getDicesPlates() {
-        return ResponseEntity.ok(gameManager.getDicePlate());
+        RestDices dices = gameManager.getDicePlate();
+        log.debug("[API] GET /farkle/dicesPlate -> {} dés",
+                dices.getDices() != null ? dices.getDices().size() : 0);
+        return ResponseEntity.ok(dices);
     }
 
     @Override
     public ResponseEntity<RestPlayer> getPlayer(@PathVariable("id") Integer id) {
+        log.debug("[API] GET /farkle/player/{}", id);
         RestPlayer player = gameManager.getRestPlayer(id);
         if (player != null) {
             return new ResponseEntity<>(player, HttpStatus.OK);
         }
+        log.debug("[API] Joueur {} non trouvé", id);
         return new ResponseEntity<>(HttpStatus.NOT_FOUND);
     }
 
     @Override
     public ResponseEntity<RestDices> getSelectedDices() {
-        return ResponseEntity.ok(gameManager.getSelectedDices());
+        RestDices dices = gameManager.getSelectedDices();
+        log.debug("[API] GET /farkle/selectedDices -> {} dés",
+                dices.getDices() != null ? dices.getDices().size() : 0);
+        return ResponseEntity.ok(dices);
     }
 
+    /**
+     * Endpoint /farkle/stateChanged - CRITIQUE pour l'exigence 1
+     * Doit retourner 1 une seule fois après chaque changement, puis 0
+     */
     @Override
     public ResponseEntity<Integer> getState() {
-        int state = gameManager.getState();
-        System.out.println("[DEBUG] Appel /farkle/stateChanged → renvoie : " + state); // ✅ ICI le bon endroit
+        Integer state = gameManager.getState();
+        log.info("[API] GET /farkle/stateChanged -> {} (EXIGENCE 1)", state);
         return ResponseEntity.ok(state);
     }
 
-
     @Override
     public ResponseEntity<RestPlayer> getWinner() {
+        log.debug("[API] GET /farkle/winner");
         RestPlayer winner = gameManager.getWinner();
         if (winner != null) {
+            log.info("[API] Gagnant trouvé: {} avec {} points", winner.getName(), winner.getScore());
             return new ResponseEntity<>(winner, HttpStatus.OK);
         }
         return new ResponseEntity<>(HttpStatus.NO_CONTENT);
     }
 
-    // Méthode utilitaire pour sérialiser les DTO
+    /**
+     * Utilitaire pour sérialiser les DTOs en JSON
+     */
     private String toJson(Object dto) {
         try {
             return objectMapper.writeValueAsString(dto);
         } catch (Exception e) {
-            log.error("Erreur lors de la sérialisation en JSON", e);
+            log.error("[API] Erreur de sérialisation JSON", e);
             return "{\"error\":\"Erreur interne du serveur\"}";
         }
     }
