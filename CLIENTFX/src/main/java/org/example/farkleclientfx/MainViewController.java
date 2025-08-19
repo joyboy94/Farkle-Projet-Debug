@@ -31,20 +31,26 @@ import java.util.stream.Collectors;
 /**
  * Contrôleur principal JavaFX du client “Farkle Pirates”.
  *
- * Principes :
- *  • On interroge le serveur via /farkle/stateChanged (0/1) toutes les secondes.
- *    Si le flag vaut 1 ou si on a trop de “0” d’affilée, on récupère l’état complet via /farkle/state.
- *  • Toutes les écritures UI se font sur le JavaFX Application Thread (Platform.runLater).
- *  • Pendant une action (ROLL / KEEP / BANK), on stoppe le polling pour éviter les collisions réseau,
- *    puis on le relance si nécessaire.
- *  • Fallback client : si le serveur n’envoie pas availableActions, on déduit les actions activables
- *    depuis l’état (dés sur le plateau, score temporaire, etc.).
- *  • UX : un toast “<nom> a joué !” s’affiche ~1,5s quand le tour change.
+ * SWITCH DE MODE :
+ *  - STRICT_MODE = true  -> Comportement examen : seul le joueur en ATTENTE poll /stateChanged ; pas de force re-sync ; aucune déduction d’actions.
+ *  - STRICT_MODE = false -> Mode compat (ancien fonctionnement) : force re-sync après N zéros ou X ms ; fallback de déduction d’actions.
  *
- * Logging :
- *  • Uniquement des System.out.println pour produire des traces lisibles par n’importe qui.
+ * Dans les deux modes :
+ *  - Les écritures UI passent par Platform.runLater.
+ *  - Le joueur ACTIF ne poll jamais /stateChanged ; après chaque POST, on fait un GET compose pour re-synchroniser l’UI.
  */
 public class MainViewController {
+
+    /* ========= SWITCH DE MODE ========= */
+    private static final boolean STRICT_MODE = true;            // <- TRUE pour l’examen
+    private static final boolean COMPAT_FORCE_RESYNC   = !STRICT_MODE;
+    private static final boolean COMPAT_DEDUCE_ACTIONS = !STRICT_MODE;
+
+    // Compat: filets de sécurité (uniquement si STRICT_MODE=false)
+    private int  zerosInARow     = 0;
+    private long lastFullFetchMs = 0L;
+    private static final int  FORCE_RESYNC_AFTER_ZEROS = 3;
+    private static final long FORCE_RESYNC_EVERY_MS    = 5000L;
 
     /* ============================
        == RÉFÉRENCES UI (FXML)  ==
@@ -56,7 +62,7 @@ public class MainViewController {
     @FXML private Button btnRoll, btnBank, btnKeep, btnQuit;
     @FXML private TableView<Map<String, String>> comboTable;
     @FXML private TableColumn<Map<String, String>, String> colCombo, colPoints;
-    @FXML private Label turnUpdateLabel; // toast “X a joué !”
+    @FXML private Label turnUpdateLabel; // toast “<name> played”
 
     /* ============================
        ====== ÉTAT / SERVICE ======
@@ -64,16 +70,16 @@ public class MainViewController {
 
     private final FarkleRestService farkleService = new FarkleRestService(); // client REST
 
-    private Integer myPlayerId = null;  // id du joueur local (fourni par le serveur)
-    private String myName = null;       // nom saisi (éventuellement normalisé côté serveur)
+    private Integer myPlayerId = null;  // id du joueur local
+    private String myName = null;       // nom local
 
-    // Dernier état reçu du serveur. Sert aussi de “cache” pour piloter l’UI.
+    // Dernier état reçu du serveur (cache UI)
     private TurnStatusDTO dernierEtatRecu = new TurnStatusDTO();
 
-    // Table des combinaisons (valeurs par défaut affichées si le serveur ne fournit rien)
+    // Table des combinaisons par défaut
     private ObservableList<Map<String, String>> defaultScoreRules;
 
-    // Représentations graphiques des dés actuellement “sur le plateau”
+    // Représentations graphiques des dés sur le plateau
     private final List<DieView> diceViewsOnPlate = new ArrayList<>();
 
     /* ============================
@@ -83,13 +89,6 @@ public class MainViewController {
     private ScheduledExecutorService pollingExecutor;     // thread planifié (daemon)
     private ScheduledFuture<?> pollingFuture;             // tâche courante
     private final AtomicBoolean isPollingActive = new AtomicBoolean(false);
-
-    // Filets de sécurité contre une éventuelle désynchronisation
-    private int  zerosInARow       = 0;        // nombre de 0 consécutifs sur /stateChanged
-    private long lastFullFetchMs   = 0L;       // date du dernier /state
-
-    private static final int  FORCE_RESYNC_AFTER_ZEROS = 3;     // après 3 “0”, on force un /state
-    private static final long FORCE_RESYNC_EVERY_MS    = 5000L; // ou bien toutes les 5 secondes
 
     /* ============================
        ========= AVATARS ==========
@@ -120,13 +119,15 @@ public class MainViewController {
 
     @FXML
     private void initialize() {
-        System.out.println("[INIT] MainViewController – démarrage");
+        System.out.println("[INIT] MainViewController – démarrage (STRICT_MODE=" + STRICT_MODE + ")");
         setupComboTable();        // colonnes + valeurs par défaut
         setupButtonHandlers();    // actions des boutons
         setupPollingExecutor();   // thread daemon pour le polling
         resetUIForNewGame();      // état neutre (pas inscrit)
         Platform.runLater(this::inscriptionJoueurEtDebut); // prompt “Pirate” quand la scène est prête
         loadAvatars();            // charge les ressources images
+        // 🔧 Le toast ne bloque jamais les clics
+        if (turnUpdateLabel != null) turnUpdateLabel.setMouseTransparent(true);
     }
 
     /** Déclare les actions des boutons. */
@@ -162,12 +163,12 @@ public class MainViewController {
        ============================ */
 
     /**
-     * Demande un nom, s’inscrit via /join, tente un état initial, puis démarre la boucle de polling.
+     * Demande un nom, s’inscrit via /join, tente un état initial, puis
+     * (ATTENTE) lance le polling ou (ACTIF) active les boutons.
      */
     private void inscriptionJoueurEtDebut() {
         resetUIForNewGame();
 
-        // Boîte de dialogue pour le nom
         TextInputDialog dialog = new TextInputDialog("Pirate");
         dialog.setTitle("Inscription Pirate");
         dialog.setHeaderText("Quel est ton nom de pirate ?");
@@ -180,16 +181,14 @@ public class MainViewController {
             return;
         }
 
-        // Appel /join
         myName = result.get().trim();
         try {
             RestPlayer joueur = farkleService.inscrireJoueur(myName);
             myPlayerId = joueur.getId();
-            myName     = joueur.getName(); // si le serveur a normalisé
+            myName     = joueur.getName(); // si normalisé
             System.out.println("[INSCRIPTION] OK => " + myName + " (ID=" + myPlayerId + ")");
             tourLabel.setText("🏴‍☠️ Bienvenue " + myName + " ! En attente d'un adversaire...");
 
-            // Essai de bootstrap d’état
             try {
                 TurnStatusDTO etatInitial = farkleService.getEtatCompose();
                 System.out.println("[INIT] État initial : " + resumeDto(etatInitial));
@@ -198,7 +197,19 @@ public class MainViewController {
                 System.out.println("[INIT] Aucun état initial disponible.");
             }
 
-            startPolling(); // on lance la boucle
+            if (dernierEtatRecu != null && !isMyTurn(dernierEtatRecu)) {
+                if (STRICT_MODE) {
+                    // ⚠️ Anti-course : on laisse ~1,2s au client qui doit devenir ACTIF
+                    // pour récupérer le 1, puis on commence à poller côté ATTENTE.
+                    System.out.println("[INIT] STRICT: démarrage du polling différé (1.2s) pour éviter de consommer le 1 de l'autre client.");
+                    pollingExecutor.schedule(this::startPolling, 1200, TimeUnit.MILLISECONDS);
+                } else {
+                    startPolling(); // compat
+                }
+            } else {
+                setActionButtonsEnabled(true);  // ACTIF
+            }
+
 
         } catch (ApiException e) {
             System.out.println("[INSCRIPTION] Échec : " + e.getMessage());
@@ -210,50 +221,82 @@ public class MainViewController {
        ========= POLLING ==========
        ============================ */
 
-    /** Démarre la boucle si elle n’est pas déjà active. */
+    /** Démarre la boucle si elle n’est pas déjà active (ATTENTE uniquement). */
     private void startPolling() {
         if (!isPollingActive.compareAndSet(false, true)) {
             System.out.println("[POLL] Déjà actif.");
             return;
         }
-        System.out.println("[POLL] Démarrage.");
+        System.out.println("[POLL] Démarrage (ATTENTE, STRICT_MODE=" + STRICT_MODE + ").");
 
         Runnable pollingTask = () -> {
             try {
-                // 1) /stateChanged => 0/1 consommable
-                Integer flag = farkleService.getStateChanged();
+                // Si je deviens actif, je stoppe immédiatement (séparation stricte)
+                if (dernierEtatRecu != null && isMyTurn(dernierEtatRecu)) {
+                    System.out.println("[POLL] Je suis actif -> arrêt polling.");
+                    stopPolling();
+                    return;
+                }
+
+                Integer flag = farkleService.getStateChanged(); // 0/1 consommable
                 boolean changed = (flag != null && flag == 1);
 
-                if (changed) zerosInARow = 0; else zerosInARow++;
+                if (STRICT_MODE) {
+                    if (changed) {
+                        TurnStatusDTO newState = farkleService.getEtatCompose(); // fetch complet déclenché par 1
+                        System.out.println("[POLL] (STRICT) Nouvel état via 1 : " + resumeDto(newState));
 
-                // 2) Force un /state périodiquement ou après n zéros
-                boolean tooOld    = (System.currentTimeMillis() - lastFullFetchMs) > FORCE_RESYNC_EVERY_MS;
-                boolean forceSync = (zerosInARow >= FORCE_RESYNC_AFTER_ZEROS) || tooOld;
+                        Platform.runLater(() -> {
+                            majInterfaceAvecEtat(newState);
+                            showPlayedToast(newState.currentPlayerName); // toast à chaque 1
 
-                // 3) Fait un /state si nécessaire
-                if (changed || forceSync || dernierEtatRecu.currentPlayerId == -1) {
-                    if (!changed && forceSync) {
-                        System.out.println("[POLL] Force re-sync (zeros=" + zerosInARow + ", tooOld=" + tooOld + ")");
+                            if (isMyTurn(newState)) {
+                                System.out.println("[POLL] Je deviens actif -> activer boutons et arrêter polling.");
+                                setActionButtonsEnabled(true); // activer D'ABORD
+                                stopPolling();                 // puis stopper le poll
+                            }
+                            if ("GAME_OVER".equals(newState.gameState)) {
+                                System.out.println("[POLL] Partie terminée -> arrêt polling.");
+                                stopPolling();
+                            }
+                        });
                     }
-                    TurnStatusDTO newState = farkleService.getEtatCompose();
-                    lastFullFetchMs = System.currentTimeMillis();
-                    System.out.println("[POLL] Nouvel état : " + resumeDto(newState));
+                    // Si 0 -> ne rien faire (aucun force re-sync)
+                } else {
+                    // ==== MODE COMPAT ====
+                    if (changed) zerosInARow = 0; else zerosInARow++;
+                    boolean tooOld    = (System.currentTimeMillis() - lastFullFetchMs) > FORCE_RESYNC_EVERY_MS;
+                    boolean forceSync = (zerosInARow >= FORCE_RESYNC_AFTER_ZEROS) || tooOld;
 
-                    // 4) Toute MAJ UI → Application Thread
-                    Platform.runLater(() -> {
-                        majInterfaceAvecEtat(newState);
-                        if ("GAME_OVER".equals(newState.gameState)) {
-                            System.out.println("[POLL] Partie terminée -> arrêt polling.");
-                            stopPolling();
+                    if (changed || (COMPAT_FORCE_RESYNC && forceSync) || dernierEtatRecu.currentPlayerId == -1) {
+                        if (!changed && (COMPAT_FORCE_RESYNC && forceSync)) {
+                            System.out.println("[POLL] (COMPAT) Force re-sync (zeros=" + zerosInARow + ", tooOld=" + tooOld + ")");
                         }
-                    });
+                        TurnStatusDTO newState = farkleService.getEtatCompose();
+                        lastFullFetchMs = System.currentTimeMillis();
+                        System.out.println("[POLL] (COMPAT) Nouvel état : " + resumeDto(newState));
+
+                        Platform.runLater(() -> {
+                            majInterfaceAvecEtat(newState);
+                            if (changed) showPlayedToast(newState.currentPlayerName); // toast seulement quand 1
+
+                            if (isMyTurn(newState)) {
+                                System.out.println("[POLL] Je deviens actif -> arrêt polling.");
+                                stopPolling();
+                                setActionButtonsEnabled(true);
+                            }
+                            if ("GAME_OVER".equals(newState.gameState)) {
+                                System.out.println("[POLL] Partie terminée -> arrêt polling.");
+                                stopPolling();
+                            }
+                        });
+                    }
                 }
             } catch (Exception e) {
                 System.out.println("[POLL] Erreur : " + e.getMessage());
             }
         };
 
-        // périodicité : 1 seconde
         pollingFuture = pollingExecutor.scheduleAtFixedRate(pollingTask, 0, 1000, TimeUnit.MILLISECONDS);
     }
 
@@ -272,18 +315,18 @@ public class MainViewController {
        ========= ACTIONS ==========
        ============================ */
 
-    private void handlerRoll() {
-        System.out.println("[ACTION] ROLL");
-        performApiCall(farkleService::lancerDes);
-    }
-
     private void handlerBank() {
+        if (btnBank.isDisabled()) return;
         System.out.println("[ACTION] BANK");
         performApiCall(farkleService::banker);
     }
-
+    private void handlerRoll() {
+        if (btnRoll.isDisabled()) return;
+        System.out.println("[ACTION] ROLL");
+        performApiCall(farkleService::lancerDes);
+    }
     private void handlerKeep() {
-        // Construit la chaîne attendue par l’API depuis les dés sélectionnés
+        if (btnKeep.isDisabled()) return;
         String selection = diceViewsOnPlate.stream()
                 .filter(DieView::isSelected)
                 .map(d -> String.valueOf(d.getValue()))
@@ -299,7 +342,8 @@ public class MainViewController {
 
     /**
      * Exécute une action REST dans un thread de fond, désactive les boutons,
-     * stoppe temporairement le polling (évite les collisions /state) et relance si besoin.
+     * (ACTIF) jamais de polling, puis re-sync immédiat via GET compose.
+     * Si on rend la main, on (re)lance le polling (ATTENTE).
      */
     private void performApiCall(FarkleApiCall apiCall) {
         if (myPlayerId == null || myPlayerId == -1) {
@@ -307,32 +351,96 @@ public class MainViewController {
             return;
         }
 
-        stopPolling();                 // on se met au calme
+        stopPolling();                 // ACTIF : pas de /stateChanged
         desactiverBoutonsPendantAction();
 
         new Thread(() -> {
             try {
-                TurnStatusDTO dto = apiCall.call();
-                System.out.println("[ACTION] DTO: " + resumeDto(dto));
+                // 1) POST (ROLL / KEEP / BANK)
+                TurnStatusDTO dtoAfterPost = apiCall.call(); // le POST retourne un DTO riche
+                System.out.println("[ACTION] DTO: " + resumeDto(dtoAfterPost));
 
+                // 1bis) Écho visuel côté ACTIF (en STRICT, l'actif ne poll pas /stateChanged)
+                if (STRICT_MODE) {
+                    showPlayedToast(myName);
+                }
+
+                // 2) Mémoriser ce que le POST a fourni (pour ne pas le perdre au re-sync)
+                String postImmersive = (dtoAfterPost.immersiveMessage != null && !dtoAfterPost.immersiveMessage.isBlank())
+                        ? dtoAfterPost.immersiveMessage : null;
+                List<Map<String, String>> postCombos =
+                        (dtoAfterPost.combinationHints != null && !dtoAfterPost.combinationHints.isEmpty())
+                                ? dtoAfterPost.combinationHints : null;
+                List<String> postActions =
+                        (dtoAfterPost.availableActions != null && !dtoAfterPost.availableActions.isEmpty())
+                                ? dtoAfterPost.availableActions : null;
+
+                // 3) Re-sync immédiat et systématique via GET "composé"
+                TurnStatusDTO refreshed = farkleService.getEtatCompose();
+
+                // 4) Fusionner les infos du POST si le re-sync ne les fournit pas
+                if ((refreshed.immersiveMessage == null || refreshed.immersiveMessage.isBlank()) && postImmersive != null) {
+                    refreshed.immersiveMessage = postImmersive;
+                }
+                if ((refreshed.combinationHints == null || refreshed.combinationHints.isEmpty()) && postCombos != null) {
+                    refreshed.combinationHints = postCombos;
+                }
+                if ((refreshed.availableActions == null || refreshed.availableActions.isEmpty()) && postActions != null) {
+                    refreshed.availableActions = postActions;
+                }
+
+                // 5) Appliquer à l'UI + orchestration du polling selon STRICT/COMPAT
                 Platform.runLater(() -> {
-                    majInterfaceAvecEtat(dto);
+                    majInterfaceAvecEtat(refreshed);
+                    boolean iAmActive = isMyTurn(refreshed);
+                    setActionButtonsEnabled(iAmActive);
 
-                    // Si ce n’est pas un FARKLE (géré avec une pause), on relance le polling
-                    // quand le tour passe à l’adversaire.
-                    if (!"FARKLE_TURN_ENDED".equals(dto.gameState)) {
-                        if (!isMyTurn(dto) && !"GAME_OVER".equals(dto.gameState)) {
-                            System.out.println("[ACTION] Tour adverse → relance polling.");
-                            pollingExecutor.schedule(this::startPolling, 500, TimeUnit.MILLISECONDS);
+                    boolean isFarkle = "FARKLE_TURN_ENDED".equals(refreshed.gameState);
+
+                    if (!iAmActive && !"GAME_OVER".equals(refreshed.gameState)) {
+                        if (STRICT_MODE) {
+                            if (isFarkle) {
+                                // ⚠️ La branche FARKLE de majInterfaceAvecEtat() relancera le polling après ~3.5 s.
+                                System.out.println("[ACTION][STRICT] FARKLE → pas de relance polling ici (pause FARKLE).");
+                            } else {
+                                // Handover normal : petite latence pour éviter de consommer le 1 de l’adversaire
+                                System.out.println("[ACTION][STRICT] Handover normal → startPolling dans 1.2s.");
+                                pollingExecutor.schedule(this::startPolling, 1200, TimeUnit.MILLISECONDS);
+                            }
+                        } else {
+                            // Mode compat : comportement historique
+                            System.out.println("[ACTION][COMPAT] startPolling dans 0.4s.");
+                            pollingExecutor.schedule(this::startPolling, 400, TimeUnit.MILLISECONDS);
                         }
                     }
                 });
+
             } catch (ApiException e) {
                 System.out.println("[ACTION] Erreur REST: " + e.getMessage());
                 Platform.runLater(() -> {
                     afficherAlerteErreur("Erreur", e.getMessage());
-                    updateActionButtons(dernierEtatRecu);
-                    pollingExecutor.schedule(this::startPolling, 500, TimeUnit.MILLISECONDS);
+                    try {
+                        // Re-sync best effort pour remettre l'UI d'équerre
+                        TurnStatusDTO refreshed = farkleService.getEtatCompose();
+                        majInterfaceAvecEtat(refreshed);
+                        boolean iAmActive = isMyTurn(refreshed);
+                        setActionButtonsEnabled(iAmActive);
+
+                        if (!iAmActive && !"GAME_OVER".equals(refreshed.gameState)) {
+                            boolean isFarkle = "FARKLE_TURN_ENDED".equals(refreshed.gameState);
+                            if (STRICT_MODE) {
+                                if (isFarkle) {
+                                    System.out.println("[ACTION][STRICT][ERR] FARKLE → pas de relance polling ici (pause FARKLE).");
+                                } else {
+                                    System.out.println("[ACTION][STRICT][ERR] Handover normal → startPolling dans 1.2s.");
+                                    pollingExecutor.schedule(this::startPolling, 1200, TimeUnit.MILLISECONDS);
+                                }
+                            } else {
+                                System.out.println("[ACTION][COMPAT][ERR] startPolling dans 0.4s.");
+                                pollingExecutor.schedule(this::startPolling, 400, TimeUnit.MILLISECONDS);
+                            }
+                        }
+                    } catch (Exception ignore) { /* best effort */ }
                 });
             }
         }, "Farkle-Action-Thread").start();
@@ -344,7 +452,7 @@ public class MainViewController {
 
     /**
      * Applique un état du serveur sur l’interface.
-     * Gère explicitement le cas FARKLE avec une pause de 3,5 s.
+     * Gère explicitement FARKLE avec une pause (immersion).
      */
     private void majInterfaceAvecEtat(TurnStatusDTO etat) {
         if (etat == null) {
@@ -353,7 +461,7 @@ public class MainViewController {
         }
         System.out.println("[UI] Mise à jour avec: " + resumeDto(etat));
 
-        // 1) Cas FARKLE : on affiche le message immersif puis on relance le polling après la pause
+        // 1) Cas FARKLE : message immersif + pause, puis reprise (ATTENTE/ACTIF selon le tour)
         if ("FARKLE_TURN_ENDED".equals(etat.gameState)) {
             this.dernierEtatRecu = etat;
             messageBoxLabel.setText(etat.immersiveMessage);
@@ -362,31 +470,21 @@ public class MainViewController {
 
             System.out.println("[UI] FARKLE détecté, pause 3.5s.");
             PauseTransition pause = new PauseTransition(Duration.seconds(3.5));
-            pause.setOnFinished(e -> startPolling());
+            pause.setOnFinished(e -> {
+                if (isMyTurn(dernierEtatRecu)) {
+                    setActionButtonsEnabled(true);
+                } else if (!"GAME_OVER".equals(dernierEtatRecu.gameState)) {
+                    startPolling();
+                }
+            });
             pause.play();
             return;
         }
 
-        // 2) Toast “X a joué !” si le tour a changé
-        boolean turnChanged =
-                (dernierEtatRecu != null &&
-                        dernierEtatRecu.currentPlayerId >= 0 &&
-                        etat.currentPlayerId          >= 0 &&
-                        !Objects.equals(etat.currentPlayerId, dernierEtatRecu.currentPlayerId));
-
-        if (turnChanged) {
-            String previousPlayer =
-                    (dernierEtatRecu.currentPlayerName != null && !dernierEtatRecu.currentPlayerName.isEmpty())
-                            ? dernierEtatRecu.currentPlayerName
-                            : "L'adversaire";
-            System.out.println("[UI] Changement de tour → " + previousPlayer + " a joué !");
-            showTurnUpdateMessage(previousPlayer + " a joué !");
-        }
-
-        // 3) On remplace notre “cache” local par l’état courant
+        // 2) Remplace le “cache” local par l’état courant
         this.dernierEtatRecu = etat;
 
-        // 4) Bandeau du haut
+        // 3) Bandeau du haut
         if (etat.currentPlayerId == -1) {
             tourLabel.setText("En attente du second joueur...");
         } else {
@@ -394,7 +492,7 @@ public class MainViewController {
                     (etat.currentPlayerName != null ? etat.currentPlayerName : "..."));
         }
 
-        // 5) Panneaux joueurs, message central, dés et combinaisons
+        // 4) Panneaux joueurs, message central, dés et combinaisons
         updatePlayerPanels(etat);
         scoreLabel.setText("Score du tour : " + etat.tempScore + " 💰");
         updateCentralMessage(etat);
@@ -406,13 +504,17 @@ public class MainViewController {
             comboTable.setItems(defaultScoreRules);
         }
 
-        // 6) Boutons d’action (avec fallback si necessary)
+        // 5) Boutons d’action (STRICT vs COMPAT)
         updateActionButtons(etat);
+
+        // 🔒 Ceinture + bretelles en STRICT : si c'est mon tour, (ré)active les boutons quoi qu'il arrive
+        if (STRICT_MODE) {
+            setActionButtonsEnabled(isMyTurn(etat) && !"GAME_OVER".equals(etat.gameState));
+        }
     }
 
     /**
-     * Calcule les actions activables et active/désactive les boutons.
-     * Fallback si availableActions est vide côté serveur.
+     * STRICT : aucune déduction. COMPAT : fallback historique.
      */
     private void updateActionButtons(TurnStatusDTO etat) {
         if (etat == null || "GAME_OVER".equals(etat.gameState)) {
@@ -422,51 +524,67 @@ public class MainViewController {
         }
 
         boolean estMonTour = isMyTurn(etat);
-        System.out.println("[BUTTONS] estMonTour=" + estMonTour +
-                ", currentPlayerId=" + etat.currentPlayerId +
-                ", myPlayerId=" + myPlayerId);
+        System.out.println("[BUTTONS] estMonTour=" + estMonTour);
 
         if (!estMonTour) {
             desactiverBoutonsPendantAction();
-            System.out.println("[BUTTONS] Désactivés (tour adverse).");
+            System.out.println("[BUTTONS] Désactivés (tour adverse / attente).");
             return;
         }
 
-        List<String> actions = etat.availableActions;
+        if (STRICT_MODE) {
+            //  STRICT : activer/désactiver sans aucune déduction
+            boolean enabled = estMonTour && !"GAME_OVER".equals(etat.gameState);
+            btnRoll.setDisable(!enabled);
+            btnBank.setDisable(!enabled);
+            long nbSelected = diceViewsOnPlate.stream().filter(DieView::isSelected).count();
+            btnKeep.setDisable(!enabled || nbSelected == 0);
+            System.out.println("[BUTTONS] STRICT -> enabled=" + enabled
+                    + " roll=" + !btnRoll.isDisabled()
+                    + ", keep=" + !btnKeep.isDisabled()
+                    + ", bank=" + !btnBank.isDisabled());
+            return; // IMPORTANT : ne rien ré-écrire ensuite
+        }
 
-        // Fallback “intelligent”
+        // --- COMPAT : fallback historique (corrigé) ---
+        List<String> actions = etat.availableActions;
         if (actions == null || actions.isEmpty()) {
             actions = new ArrayList<>();
 
             boolean hasKept = etat.keptDiceThisTurn != null && !etat.keptDiceThisTurn.isEmpty();
             boolean hasDice = etat.diceOnPlate       != null && !etat.diceOnPlate.isEmpty();
+            int temp = etat.tempScore;
 
-            // Début de tour (rien gardé, rien sur le plateau, score 0)
-            if (!hasKept && !hasDice && etat.tempScore == 0) {
+            // Début de tour (rien gardé, rien sur le plateau, 0 point)
+            if (!hasKept && !hasDice && temp == 0) {
                 actions.add("ROLL");
             }
+
             // Après un lancer : dés sur le plateau
             if (hasDice) {
                 actions.add("SELECT_DICE");
-                if (etat.tempScore > 0) actions.add("BANK");
+                if (temp > 0) {
+                    actions.add("BANK");
+                    actions.add("ROLL"); // autoriser la relance après une sélection valide
+                }
             }
+
             // Hot dice : plus de dés sur le plateau mais un score de tour > 0
-            if (!hasDice && etat.tempScore > 0) {
+            if (!hasDice && temp > 0) {
                 actions.add("ROLL");
                 actions.add("BANK");
             }
         }
 
-        // Activation effective
         btnRoll.setDisable(!actions.contains("ROLL"));
         btnBank.setDisable(!actions.contains("BANK"));
         long nbSelected = diceViewsOnPlate.stream().filter(DieView::isSelected).count();
         btnKeep.setDisable(!actions.contains("SELECT_DICE") || nbSelected == 0);
 
-        System.out.println("[BUTTONS] Actions=" + actions +
-                " -> roll=" + !btnRoll.isDisabled() +
-                ", keep=" + !btnKeep.isDisabled() +
-                ", bank=" + !btnBank.isDisabled());
+        System.out.println("[BUTTONS] COMPAT actions=" + actions
+                + " -> roll=" + !btnRoll.isDisabled()
+                + ", keep=" + !btnKeep.isDisabled()
+                + ", bank=" + !btnBank.isDisabled());
     }
 
     /** Texte central (message immersif, fin de partie, etc.). */
@@ -547,13 +665,27 @@ public class MainViewController {
         }
     }
 
-    /** Affiche un toast centré “<nom> a joué !” pendant ~1,5s. */
+    /** Toast “<name> played” ~1s (côté attente, appelé à chaque 1). */
+    private void showPlayedToast(String activeName) {
+        final String labelText = ((activeName == null || activeName.isBlank()) ? "Player" : activeName) + " played";
+        Platform.runLater(() -> {
+            if (turnUpdateLabel != null) {
+                turnUpdateLabel.setText(labelText);
+                turnUpdateLabel.setVisible(true);
+                // Astuce FXML : le label est mouseTransparent (cf. initialize)
+                PauseTransition t = new PauseTransition(Duration.seconds(1.0));
+                t.setOnFinished(e -> turnUpdateLabel.setVisible(false));
+                t.playFromStart();
+            }
+        });
+    }
+
+    /** Ancien toast “changement de tour” — conservé si besoin ailleurs. */
     private void showTurnUpdateMessage(String message) {
         Platform.runLater(() -> {
             if (turnUpdateLabel != null) {
                 turnUpdateLabel.setText(message);
                 turnUpdateLabel.setVisible(true);
-                // Astuce FXML : mettre mouseTransparent="true" pour ne pas bloquer les clics.
                 PauseTransition pause = new PauseTransition(Duration.seconds(1.5));
                 pause.setOnFinished(e -> turnUpdateLabel.setVisible(false));
                 pause.play();
@@ -590,11 +722,19 @@ public class MainViewController {
         }
     }
 
-    /** Désactive tous les boutons d’action (utile pendant une requête). */
+    /** Désactive tous les boutons d’action (utile pendant une requête ou quand ce n’est pas notre tour). */
     private void desactiverBoutonsPendantAction() {
         btnRoll.setDisable(true);
         btnBank.setDisable(true);
         btnKeep.setDisable(true);
+    }
+
+    /** Active/désactive les boutons selon un booléen simple (sans logique métier). */
+    private void setActionButtonsEnabled(boolean enabled) {
+        btnRoll.setDisable(!enabled);
+        btnBank.setDisable(!enabled);
+        long nbSelected = diceViewsOnPlate.stream().filter(DieView::isSelected).count();
+        btnKeep.setDisable(!enabled || nbSelected == 0);
     }
 
     /** Indique si, selon l’état serveur, c’est notre tour. */
@@ -706,8 +846,8 @@ public class MainViewController {
 
     /**
      * Petit composant graphique pour afficher un dé.
-     * – Cliquable si on a le droit de sélectionner des dés.
-     * – Notifie updateActionButtons après chaque toggle pour (dés)activer “Garder la sélection”.
+     * – Cliquable pendant MON tour. STRICT : libre ; COMPAT : respecte le vieux “canSelect”.
+     * – Notifie updateActionButtons après chaque toggle pour activer/désactiver “Garder”.
      */
     private class DieView extends StackPane {
         private final int value;
@@ -730,15 +870,16 @@ public class MainViewController {
 
             setOnMouseClicked(e -> {
                 if (isMyTurn(dernierEtatRecu)) {
-                    List<String> actions = dernierEtatRecu.availableActions;
-                    // Sélection autorisée si le serveur l’indique
-                    // OU en fallback s’il y a des dés sur le plateau
-                    boolean canSelect = (actions != null && actions.contains("SELECT_DICE")) ||
-                            ((actions == null || actions.isEmpty())
-                                    && dernierEtatRecu.diceOnPlate != null
-                                    && !dernierEtatRecu.diceOnPlate.isEmpty());
-
-                    if (canSelect) toggleSelection();
+                    if (STRICT_MODE) {
+                        toggleSelection();
+                    } else {
+                        List<String> actions = dernierEtatRecu.availableActions;
+                        boolean canSelect = (actions != null && actions.contains("SELECT_DICE")) ||
+                                ((actions == null || actions.isEmpty())
+                                        && dernierEtatRecu.diceOnPlate != null
+                                        && !dernierEtatRecu.diceOnPlate.isEmpty());
+                        if (canSelect) toggleSelection();
+                    }
                 }
             });
         }
